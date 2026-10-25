@@ -1,0 +1,28 @@
+format: 2
+
+shipment:
+  name: mercs2-profiler
+  title: Profiler
+  version: 0.1.0
+  target: retail
+  authors: [Mercenaries Fan Build]
+  description: Tracy profiler zones and frame marks from the running game, recorded by a Tracy capture that connects to it.
+  license: MIT
+  tags: [profiler, performance, tracy, diagnostics]
+
+load:
+  requires:
+    # The ASI imports m2-sdk.dll: the process's one MinHook and the per-module log. Without the DLL
+    # Windows refuses to load the ASI.
+    - { shipment: m2-sdk, version: "^0.4" }
+
+contributions:
+  # The profiler ASI (built from client/ by client/scripts/build_asi.sh). It finds RunFrame by byte
+  # signature (mercs2_formats::profiler_sites) and detours it: 0x00630EF0 in the v1.0-code builds,
+  # 0x00630E10 in v1.1. It detours IDirect3DDevice9::Present to draw its overlay. It replaces the
+  # entries of the Pimp job system's two per-CPU handler tables with zone trampolines: 0x019F904C and
+  # 0x019F9178 in v1.0, 0x019F804C and 0x019F8178 in v1.1.
+  - kind: native_hook
+    target: retail
+    plugin: src/mercs2_profiler.asi
+    touches: ["0x00630EF0", "0x00630E10", "IDirect3DDevice9::Present", "0x019F904C", "0x019F9178", "0x019F804C", "0x019F8178"]
