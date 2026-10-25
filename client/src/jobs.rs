@@ -131,11 +131,18 @@ unsafe fn run(cpu: usize, slot: usize, arg: usize) {
     }
     let is_cells = slot as u32 == CELLS_SLOT.load(Ordering::Relaxed);
     let counter_before = if is_cells { read_cells_counter() } else { None };
+    if is_cells && crate::shadow::ENABLED.load(Ordering::Relaxed) {
+        // SAFETY: on main thread, with a live job 17 about to run.
+        unsafe { crate::shadow::pre_handler() };
+    }
     // SAFETY: a trampoline is in the table only after its original was stored (see `track`).
     let f: Handler = unsafe { core::mem::transmute::<usize, Handler>(f) };
     unsafe { f(arg) };
     if let Some(before) = counter_before {
         if let Some(after) = read_cells_counter() {
+            if crate::shadow::ENABLED.load(Ordering::Relaxed) {
+                crate::shadow::post_handler(before, after);
+            }
             let changes = after.wrapping_sub(before);
             CELLS_INVOCATIONS.fetch_add(1, Ordering::Relaxed);
             CELLS_CHANGES_SEEN.fetch_add(u64::from(changes), Ordering::Relaxed);
