@@ -1,0 +1,51 @@
+[package]
+name = "mercs2_profiler"
+version = "0.1.0"
+description = "Mercenaries 2 profiler ASI: Tracy zones and frame marks from the running game"
+edition = "2024"
+license = "MIT"
+publish = false
+
+# Standalone package: its own workspace root.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+# m2-sdk.dll's bindings (mercs2_formats::mod_runtime) and the site resolver (mercs2_formats::profiler_sites).
+mercs2_formats = "5.0"
+# Tracy 0.14.1 (tracy-client-sys 0.30.1). On demand: nothing is recorded until a capture connects.
+# Manual lifetime: the profiler starts from the start-up thread, never under the loader lock.
+tracy-client = { version = "=0.19.0", default-features = false, features = ["enable", "ondemand", "manual-lifetime"] }
+# The game exe's sha256 in each samples file, so offline symbolisation picks that build's function table.
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+# Direct3D 9 COM interfaces and GDI, for the overlay.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D9",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_Performance",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
