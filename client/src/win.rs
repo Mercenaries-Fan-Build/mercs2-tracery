@@ -213,6 +213,16 @@ unsafe extern "C" fn run_frame() {
     if let Some(counter) = jobs::read_cells_counter() {
         tracy_client::plot!("cells counter", f64::from(counter));
     }
+    // Every 1000 frames, log current shadow stats so they survive a crash before F5-STOP.
+    if frames % 1000 == 0 && crate::shadow::ENABLED.load(Ordering::Relaxed) {
+        let (inv, m, mis, port, game, _walk) = crate::shadow::stats();
+        if inv > 0 {
+            log(&format!(
+                "[*] mercs2_profiler: shadow heartbeat (frame {frames}): {inv} inv, {m} matches ({:.2}%), {mis} mismatches; port emitted {port} vs game {game}",
+                100.0 * m as f64 / inv as f64
+            ));
+        }
+    }
 
     let ms = began.elapsed().as_secs_f32() * 1000.0;
     let frames = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
