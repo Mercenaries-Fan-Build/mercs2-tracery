@@ -409,6 +409,13 @@ fn serve_requests(rx: mpsc::Receiver<Request>, addr: SocketAddrV4) {
                     "[*] mercs2_profiler: job 17 totals: {inv} invocations, {chg} changes ({:.3}/inv), {nonzero} non-zero invocations, max {max_diff} changes/inv, counter max {max_after}",
                     chg as f64 / inv.max(1) as f64
                 ));
+                let (sh_inv, sh_match, sh_mis, sh_port, sh_game, _sh_walk) = crate::shadow::stats();
+                if sh_inv > 0 {
+                    log(&format!(
+                        "[*] mercs2_profiler: cells port shadow: {sh_inv} invocations, {sh_match} count-matches ({:.3}% match), {sh_mis} mismatches; port emitted {sh_port} changes vs game {sh_game}",
+                        100.0 * sh_match as f64 / sh_inv as f64
+                    ));
+                }
                 let ended = samples.take().map(|r| {
                     r.finish().map(|f| {
                         log("[*] mercs2_profiler: what sampling cost each thread:");
@@ -605,6 +612,10 @@ fn start() -> Result<(), String> {
         cells_ring.counter,
         cells_ring.ring
     ));
+    // Shadow mode: run the Rust port against the game's actual job 17 inputs each invocation and
+    // compare its change count to the game's ring diff. Enabled at startup; stats are logged on STOP.
+    crate::shadow::ENABLED.store(true, Ordering::Release);
+    log("[*] mercs2_profiler: cells port shadow mode on");
 
     let img = mapped()?;
     let code = img.code_ranges();
