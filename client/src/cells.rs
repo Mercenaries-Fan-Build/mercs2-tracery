@@ -17,7 +17,6 @@
 //! against a copy of the inputs into a shadow change-list and compares it to what the original wrote. A
 //! mismatch is a fatal error naming the cell and sub-slot. See [`verify`].
 
-use core::ffi::c_void;
 
 /// What the per-cell loop writes: a cell slot's new LOD byte, from its old byte, together with the slot's
 /// owning entity id. The game appends these to a critical-section-guarded list at `0xDD5770/0xDD5790`.
@@ -38,7 +37,11 @@ pub struct Config(pub [u8; 0x60]);
 
 /// The named fields of a config block. Game offsets (v1.0) in comments.
 impl Config {
+    /// `cfg[0x04]`: shift. `2 << (shift - 1)` is the cell's world size (`DAT_00F79520`).
+    pub fn shift(&self) -> u8 { self.0[0x04] }
     pub fn grid_dim(&self) -> i16 { self.i16(0x06) }
+    /// `cfg[0x08]`: cells-per-row of the outer grid (`FUN_00735BD0` splits `cell_id` by this).
+    pub fn outer_grid_width(&self) -> i16 { self.i16(0x08) }
     pub fn inner_count(&self) -> i16 { self.i16(0x0a) }
     pub fn origin_x(&self) -> f32 { self.f32(0x0c) }
     pub fn origin_y(&self) -> f32 { self.f32(0x10) }
@@ -231,6 +234,36 @@ pub fn per_sub_slot(ctx: &SlotContext<'_>, cell: &Cell, i: usize) -> SlotOutcome
     SlotOutcome::Band(acc)
 }
 
+/// `FUN_00735BD0` + `FUN_00735C80` port: iterate every cell this job invocation covers, compute each cell's
+/// outer-grid AABB from `cell_id`, call [`cell_group_min`] to get the group-min threshold, then run
+/// [`per_cell_test`] against that threshold. Pure: reads borrowed arguments, writes to `sink` only.
+///
+/// `cell_size` is `2 << (cfg.shift() - 1)` as `f32`, which the handler normally caches in a global
+/// (`DAT_00F79520`); the port recomputes it from `cfg` so no global state is needed.
+pub fn job_17_run<S: Sink>(cells: &[&Cell], cfg: &Config, arr: &DistanceBlock, sink: &mut S) {
+    let outer = cfg.outer_grid_width();
+    if outer <= 0 {
+        return;
+    }
+    let shift = cfg.shift();
+    // `2 << (shift - 1)` as `f32`. The game computes it with `shl edx, cl; fild [esp]` so the result is
+    // integer-exact for any `shift <= 31`; saturating_sub guards the undefined `shl` by `-1` case.
+    let cell_size = (2u32 << u32::from(shift).saturating_sub(1)) as f32;
+    let origin_x = cfg.origin_x();
+    let origin_z = cfg.origin_z();
+    for cell in cells {
+        let cell_id = cell.cell_id();
+        let row = i32::from(cell_id) / i32::from(outer);
+        let col = i32::from(cell_id) - row * i32::from(outer);
+        let world_x = origin_x + (col as f32) * cell_size;
+        let world_z = origin_z + (row as f32) * cell_size;
+        let bb = Box2D { xmin: world_x, zmin: world_z, xmax: world_x + cell_size, zmax: world_z + cell_size };
+        let mut out = [0.0f32; 4];
+        let threshold = cell_group_min(&mut out, arr, &bb);
+        per_cell_test(cell, cfg, arr, threshold, sink);
+    }
+}
+
 /// The outer loop of `FUN_00735640`: computes the cell's world coordinates, derives the fade cutoff from
 /// the group-min threshold, then walks each sub-slot and emits a [`Change`] when the state transitions.
 ///
@@ -269,20 +302,6 @@ pub fn per_cell_test<S: Sink>(cell: &Cell, cfg: &Config, arr: &DistanceBlock, th
             }
         }
     }
-}
-
-/// What a single invocation of the port needs: the slot's config, the output buffer base, the viewpoint and
-/// the cell-size scale, plus the list of cells to process. All as borrowed references — no globals.
-pub struct Inputs<'a> {
-    pub config: &'a Config,
-    /// The output buffer the game writes LOD updates through (same layout as the game's `[arr_ptr + N]`).
-    pub output: *mut c_void,
-    /// Viewpoint position (`float[3]`), the game's `0x1176260` dereference.
-    pub viewpoint: [f32; 3],
-    /// Cell-size scale (`2.0 << (shift-1)`), the game's `0xF79520`.
-    pub cell_size: f32,
-    /// Cells to process this invocation.
-    pub cells: &'a [*mut Cell],
 }
 
 /// Where the port writes its results. In production this is the game's live change-list; in verification it
@@ -386,15 +405,6 @@ pub fn cell_group_min(out: &mut [f32; 4], block: &DistanceBlock, b: &Box2D) -> f
     running
 }
 
-/// Run the port over `inputs.cells`, appending each sub-slot change to `sink`.
-///
-/// Not yet implemented. The scaffold is in place so the hook, routing, verification harness and benchmarks
-/// can be built around a stable interface; the per-cell arithmetic lands in follow-up changes, each with its
-/// own matching bit-exact test against recorded cases.
-pub fn run<S: Sink>(_inputs: &Inputs<'_>, _sink: &mut S) {
-    unimplemented!("the per-cell arithmetic for jobtype 0xECAED415 lands incrementally with its tests")
-}
-
 /// A sink that just records changes, for tests and the verification mode.
 #[derive(Default, Debug)]
 pub struct RecordingSink(pub Vec<Change>);
@@ -417,21 +427,6 @@ mod tests {
         assert_eq!(s.0.len(), 2);
         assert_eq!(s.0[0].entity_id, 0x1234_5678);
         assert_eq!(s.0[1].old_new, 0x2030);
-    }
-
-    #[test]
-    #[should_panic(expected = "lands incrementally with its tests")]
-    fn the_run_function_is_not_implemented_yet() {
-        let cfg = Config([0; 0x60]);
-        let inputs = Inputs {
-            config: &cfg,
-            output: core::ptr::null_mut(),
-            viewpoint: [0.0; 3],
-            cell_size: 32.0,
-            cells: &[],
-        };
-        let mut sink = RecordingSink::default();
-        run(&inputs, &mut sink);
     }
 
     const BOX: Box2D = Box2D { xmin: -10.0, zmin: -5.0, xmax: 20.0, zmax: 15.0 };
@@ -586,6 +581,16 @@ mod tests {
         CfgBuild { grid_dim, inner_count: 1, origin_x, origin_z, cell_step, sub_step: 1.0, inner_scale: 10.0, margin: 5.0, gates: [1, 0, 0, 0], ..Default::default() }.build()
     }
 
+    /// `basic_cfg` with grid_dim and cell_step aligned to the outer grid (so `per_cell_test`'s world coords
+    /// agree with `job_17_run`'s), plus shift (sets cell_size) and outer_grid_width.
+    fn outer_cfg(outer: i16, shift: u8) -> Config {
+        let cell_size = (2u32 << u32::from(shift).saturating_sub(1)) as i32;
+        let mut c = basic_cfg(outer, cell_size, 0.0, 0.0);
+        c.0[0x04] = shift;
+        c.0[0x08..0x0a].copy_from_slice(&outer.to_le_bytes());
+        c
+    }
+
     fn mk_cell(cell_id: i16, sub_slot_count: i16) -> Box<Cell> {
         let mut c = Box::new(Cell([0; 0x1f0]));
         c.0[0x1e4..0x1e6].copy_from_slice(&sub_slot_count.to_le_bytes());
@@ -668,6 +673,34 @@ mod tests {
         assert_eq!(sink.0[0].old_new, 0x4100); // new=0x41 << 8, old=0x00
         assert_eq!(sink.0[1].entity_id, 0x2222);
         assert_eq!(sink.0[1].old_new, 0x0040); // old=0x40, new=0 (fade)
+    }
+
+    #[test]
+    fn job_17_run_does_nothing_when_the_outer_grid_width_is_zero() {
+        let cfg = basic_cfg(1, 100, 0.0, 0.0); // outer_grid_width = 0 (default)
+        let cell = mk_cell(0, 1);
+        let arr = mk_arr([Point::default(); 4]);
+        let mut sink = RecordingSink::default();
+        job_17_run(&[&cell], &cfg, &arr, &mut sink);
+        assert!(sink.0.is_empty());
+    }
+
+    #[test]
+    fn job_17_run_processes_each_cell_in_order() {
+        // Outer grid 2x2, cell_size = 2^3 = 8.
+        let cfg = outer_cfg(2, 3);
+        let p = Point::default();
+        let arr = mk_arr([p; 4]);
+        let mut c0 = mk_cell(0, 1); // row 0, col 0 — world box (0, 0, 8, 8)
+        Slot { entity_id: 0x0001, state: 0x40, key: 5, ..Default::default() }.write_to(&mut c0, 0);
+        let mut c1 = mk_cell(1, 1); // row 0, col 1 — world box (8, 0, 16, 8)
+        Slot { entity_id: 0x0002, state: 0x40, key: 5, ..Default::default() }.write_to(&mut c1, 0);
+        let mut sink = RecordingSink::default();
+        job_17_run(&[&c0, &c1], &cfg, &arr, &mut sink);
+        // Each cell fades its single sub-slot from 0x40 to 0; order matches cells slice.
+        assert_eq!(sink.0.len(), 2);
+        assert_eq!(sink.0[0].entity_id, 0x0001);
+        assert_eq!(sink.0[1].entity_id, 0x0002);
     }
 
     #[test]
