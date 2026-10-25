@@ -7,6 +7,7 @@ pub mod cells;
 pub mod config;
 #[cfg(all(windows, target_arch = "x86"))]
 pub mod crash;
+pub mod shadow;
 pub mod cpu;
 pub mod jobs;
 pub mod route;
