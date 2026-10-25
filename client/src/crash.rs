@@ -14,9 +14,11 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
-use windows_sys::Win32::Foundation::EXCEPTION_ACCESS_VIOLATION;
+use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, MODULEENTRY32W, Module32FirstW, Module32NextW, TH32CS_SNAPMODULE};
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
+use windows_sys::Win32::Foundation::CloseHandle;
 
 const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
@@ -238,9 +240,34 @@ unsafe fn write_body(
         writeln!(f)?;
     }
 
+    writeln!(f, "== Loaded modules (name, base, size) ==")?;
+    unsafe { write_modules(f)? };
+    writeln!(f)?;
+
     writeln!(f, "== Note ==")?;
     writeln!(f, "This handler returned EXCEPTION_CONTINUE_SEARCH.")?;
     writeln!(f, "pmc_blackbox.log should also contain its own VEH summary written after this file.")?;
+    Ok(())
+}
+
+/// Snapshot the loaded modules via Toolhelp32 and write one line per module (name, base, size).
+unsafe fn write_modules(f: &mut std::fs::File) -> std::io::Result<()> {
+    let snap: HANDLE = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0) };
+    if snap == INVALID_HANDLE_VALUE {
+        writeln!(f, "(CreateToolhelp32Snapshot failed)")?;
+        return Ok(());
+    }
+    let mut me: MODULEENTRY32W = unsafe { core::mem::zeroed() };
+    me.dwSize = size_of::<MODULEENTRY32W>() as u32;
+    let mut more = unsafe { Module32FirstW(snap, &mut me) } != 0;
+    while more {
+        let n = me.szModule.iter().position(|&c| c == 0).unwrap_or(me.szModule.len());
+        let name = String::from_utf16_lossy(&me.szModule[..n]);
+        let base = me.modBaseAddr as usize;
+        writeln!(f, "{name:<28} {base:#010x}..{:#010x} ({} bytes)", base + me.modBaseSize as usize, me.modBaseSize)?;
+        more = unsafe { Module32NextW(snap, &mut me) } != 0;
+    }
+    unsafe { CloseHandle(snap) };
     Ok(())
 }
 
