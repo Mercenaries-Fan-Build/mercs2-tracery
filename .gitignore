@@ -1,0 +1,4 @@
+client/target/
+.DS_Store
+# The built ASI, staged for the Shipment (manifest.yaml declares src/mercs2_profiler.asi).
+/src/mercs2_profiler.asi
