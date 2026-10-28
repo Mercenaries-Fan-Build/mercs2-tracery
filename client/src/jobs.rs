@@ -73,6 +73,25 @@ pub fn read_cells_counter() -> Option<u32> {
     (counter != 0).then(|| unsafe { (counter as usize as *const u32).read_volatile() })
 }
 
+/// The change ring's base address if the site is known. Entries are 16 bytes: `{entity_id: u32,
+/// old | new << 8: u16, _: u16, _: u64}` (`FUN_00735840` and the batch push `FUN_00518830`).
+pub fn cells_ring_base() -> Option<usize> {
+    let ring = (CELLS_RING.load(Ordering::Acquire) >> 32) as u32 as usize;
+    (ring != 0).then_some(ring)
+}
+
+/// The change ring site, once set.
+pub fn cells_change_ring() -> Option<CellsChangeRing> {
+    let packed = CELLS_RING.load(Ordering::Acquire);
+    (packed != 0).then_some(CellsChangeRing { counter: packed as u32, ring: (packed >> 32) as u32 })
+}
+
+/// The address of the change ring's counter if the site is known.
+pub fn cells_counter_addr() -> Option<usize> {
+    let counter = CELLS_RING.load(Ordering::Acquire) as u32 as usize;
+    (counter != 0).then_some(counter)
+}
+
 /// A monotonic max update that returns true when `v` was larger than any value seen before.
 fn fetch_max(a: &AtomicU32, v: u32) -> bool {
     let mut old = a.load(Ordering::Relaxed);
@@ -137,7 +156,22 @@ unsafe fn run(cpu: usize, slot: usize, arg: usize) {
     }
     // SAFETY: a trampoline is in the table only after its original was stored (see `track`).
     let f: Handler = unsafe { core::mem::transmute::<usize, Handler>(f) };
-    unsafe { f(arg) };
+    let shadowing = is_cells && crate::shadow::ENABLED.load(Ordering::Relaxed);
+    let (entry_tag, sw_before) = if shadowing { (crate::shadow::x87_entry().0, crate::shadow::x87_status()) } else { (0, 0) };
+    if is_cells && !shadowing {
+        // SAFETY: the jobtype's handler, called as the game calls it; the game's handler does not run.
+        #[cfg(all(windows, target_arch = "x86"))]
+        unsafe {
+            crate::live::game::run()
+        };
+        #[cfg(not(all(windows, target_arch = "x86")))]
+        unreachable!("jobtype 0xECAED415 is dispatched only in the game");
+    } else {
+        unsafe { f(arg) };
+    }
+    if shadowing {
+        crate::shadow::note_live_x87(sw_before, crate::shadow::x87_status(), entry_tag);
+    }
     if let Some(before) = counter_before {
         if let Some(after) = read_cells_counter() {
             if crate::shadow::ENABLED.load(Ordering::Relaxed) {
