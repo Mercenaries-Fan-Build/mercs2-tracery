@@ -1,0 +1,62 @@
+name: Lint
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# The version of `qm` this Shipment is checked against. Bump it to pick up new rules.
+#
+# There is no digest to bump alongside it: the expected sha256 is read from GitHub's own record of
+# the release asset, which is the same thing you would be copying by hand — so pinning it here would
+# add a second place to get out of date without adding any assurance.
+env:
+  QM_VERSION: v0.16.0
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # The manifest's native_hook points at src/lua_bridge.asi, which is built from client/
+      # rather than committed; lint checks that the file it names exists.
+      - name: Build the client ASI
+        uses: ./.github/actions/build-asi
+
+      - name: Install qm
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          repo=Mercenaries-Fan-Build/mercs2-wad-simulator
+          asset=qm-linux-x86_64
+
+          # GitHub records a sha256 for every release asset. Read it BEFORE downloading, so the
+          # check is against what the release claims to hold rather than against the bytes that
+          # happened to arrive.
+          want=$(gh api "repos/$repo/releases/tags/$QM_VERSION" \
+            --jq ".assets[] | select(.name == \"$asset\") | .digest")
+          if [ -z "$want" ]; then
+            echo "::error::$asset is not in $QM_VERSION — check the version pin in this workflow"
+            exit 1
+          fi
+          want=${want#sha256:}
+
+          gh release download "$QM_VERSION" --repo "$repo" --pattern "$asset" --output qm
+          got=$(sha256sum qm | cut -d' ' -f1)
+          if [ "$want" != "$got" ]; then
+            echo "::error::$asset failed verification — expected $want, got $got"
+            exit 1
+          fi
+          echo "qm $QM_VERSION verified: $got"
+          chmod +x qm
+
+      # Hermetic: no game install, no retail WADs, no network beyond fetching qm. Gated on the EXIT CODE,
+      # not on what gets printed.
+      - name: Lint this Shipment
+        run: ./qm lint .
+
+      - name: What was checked
+        if: always()
+        run: ./qm rules
