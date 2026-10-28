@@ -135,7 +135,7 @@ fn wide(s: &str) -> Vec<u16> {
 }
 
 /// Log, show the reason, end the process.
-fn fatal(msg: &str) -> ! {
+pub(crate) fn fatal(msg: &str) -> ! {
     log(&format!("[!] mercs2_profiler: FATAL: {msg}"));
     let text = wide(&format!("{msg}\n\nThe game will now exit."));
     let title = wide(TITLE);
@@ -213,19 +213,27 @@ unsafe extern "C" fn run_frame() {
     if let Some(counter) = jobs::read_cells_counter() {
         tracy_client::plot!("cells counter", f64::from(counter));
     }
-    // Every 1000 frames, log current shadow stats so they survive a crash before F5-STOP.
-    if frames % 1000 == 0 && crate::shadow::ENABLED.load(Ordering::Relaxed) {
-        let (inv, m, mis, port, game, _walk) = crate::shadow::stats();
-        if inv > 0 {
-            log(&format!(
-                "[*] mercs2_profiler: shadow heartbeat (frame {frames}): {inv} inv, {m} matches ({:.2}%), {mis} mismatches; port emitted {port} vs game {game}",
-                100.0 * m as f64 / inv as f64
-            ));
-        }
-    }
 
     let ms = began.elapsed().as_secs_f32() * 1000.0;
     let frames = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    // Every 1000 frames, log current shadow stats so they survive a crash before F5-STOP.
+    if frames % 1000 == 0 && crate::shadow::ENABLED.load(Ordering::Relaxed) {
+        let (inv, _m, _mis, port, game, _walk) = crate::shadow::stats();
+        if inv > 0 {
+            let (clean, cmatch, over, under, overlapped, content) = crate::shadow::clean_stats();
+            log(&format!(
+                "[*] mercs2_profiler: shadow heartbeat (frame {frames}): {inv} inv, {port} port vs {game} game changes (not attributable); \
+                 CLEAN {clean} ({:.3}% match): {over} port-over, {under} port-under, {content} content-mismatch; {overlapped} overlapped",
+                if clean == 0 { 100.0 } else { 100.0 * cmatch as f64 / clean as f64 }
+            ));
+            for l in crate::shadow::drain_diffs() {
+                log(&format!("[*] mercs2_profiler: {l}"));
+            }
+            for l in crate::shadow::candidate_report() {
+                log(&format!("[*] mercs2_profiler: {l}"));
+            }
+        }
+    }
     let avg = if frames == 1 { ms } else { f32::from_bits(AVERAGE_MS.load(Ordering::Relaxed)) * (1.0 - AVERAGE_WEIGHT) + ms * AVERAGE_WEIGHT };
     FRAME_MS.store(ms.to_bits(), Ordering::Relaxed);
     AVERAGE_MS.store(avg.to_bits(), Ordering::Relaxed);
@@ -419,12 +427,23 @@ fn serve_requests(rx: mpsc::Receiver<Request>, addr: SocketAddrV4) {
                     "[*] mercs2_profiler: job 17 totals: {inv} invocations, {chg} changes ({:.3}/inv), {nonzero} non-zero invocations, max {max_diff} changes/inv, counter max {max_after}",
                     chg as f64 / inv.max(1) as f64
                 ));
-                let (sh_inv, sh_match, sh_mis, sh_port, sh_game, _sh_walk) = crate::shadow::stats();
+                let (sh_inv, _sh_match, _sh_mis, sh_port, sh_game, _sh_walk) = crate::shadow::stats();
                 if sh_inv > 0 {
+                    let (clean, cmatch, over, under, overlapped, content) = crate::shadow::clean_stats();
                     log(&format!(
-                        "[*] mercs2_profiler: cells port shadow: {sh_inv} invocations, {sh_match} count-matches ({:.3}% match), {sh_mis} mismatches; port emitted {sh_port} changes vs game {sh_game}",
-                        100.0 * sh_match as f64 / sh_inv as f64
+                        "[*] mercs2_profiler: cells port shadow: {sh_inv} invocations; raw totals {sh_port} port vs {sh_game} game changes are NOT attributable (the ring counter is global and the game writes it under a shared critical section)"
                     ));
+                    log(&format!(
+                        "[*] mercs2_profiler: cells port shadow, attributable only: {clean} clean invocations, {cmatch} count-matches ({:.3}%), {over} port-over, {under} port-under, {content} content-mismatches; {overlapped} overlapped and discarded",
+                        if clean == 0 { 100.0 } else { 100.0 * cmatch as f64 / clean as f64 }
+                    ));
+                    log(&crate::shadow::x87_report());
+                    for l in crate::shadow::drain_diffs() {
+                        log(&format!("[*] mercs2_profiler: {l}"));
+                    }
+                    for l in crate::shadow::candidate_report() {
+                        log(&format!("[*] mercs2_profiler: {l}"));
+                    }
                 }
                 let ended = samples.take().map(|r| {
                     r.finish().map(|f| {
@@ -623,13 +642,21 @@ fn start() -> Result<(), String> {
         cells_ring.ring
     ));
     // Shadow mode: run the Rust port against the game's actual job 17 inputs each invocation and
-    // compare its change count to the game's ring diff. Enabled at startup; stats are logged on STOP.
-    crate::shadow::ENABLED.store(true, Ordering::Release);
-    log("[*] mercs2_profiler: cells port shadow mode on");
+    // compare its change count to the game's ring diff. Enabled by `cells_shadow`; stats are logged on STOP.
+    // Off, the port is the jobtype's handler (`crate::live`).
+    if config().cells_shadow {
+        crate::shadow::ENABLED.store(true, Ordering::Release);
+        log("[*] mercs2_profiler: cells port shadow mode on: the game's handler runs, the port is compared beside it");
+    } else {
+        log("[*] mercs2_profiler: cells port shadow mode off: the port is the jobtype's handler");
+    }
 
     let img = mapped()?;
     let code = img.code_ranges();
     let sha = exe_sha256()?;
+    if config().cells_shadow {
+        log(&crate::shadow::arm_game_copy(&sha));
+    }
     let sha_hex: String = sha.iter().map(|b| format!("{b:02x}")).collect();
     log(&format!(
         "[*] mercs2_profiler: exe sha256 {sha_hex}; image base {:#x}; code {}",
