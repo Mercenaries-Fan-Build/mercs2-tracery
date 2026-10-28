@@ -23,6 +23,10 @@ job_workers = 1
 ; The jobtypes the extra workers run instead of the thread that dequeues them: jobtype hashes
 ; (0x...), comma-separated; empty routes none. Only jobtypes checked for routing are accepted.
 route_jobtypes =
+; Shadow mode (on/off). off: the Rust port of jobtype 0xECAED415 is that jobtype's handler. on: the game's
+; handler runs and the port runs beside it on the same inputs, compared on every invocation: a diagnostic
+; that pays for both, so leave it off when measuring.
+cells_shadow = off
 ";
 
 /// The range `sample_rate_hz` accepts.
@@ -37,6 +41,7 @@ pub struct Config {
     pub sample_rate_hz: u32,
     pub job_workers: u32,
     pub route_jobtypes: Vec<u32>,
+    pub cells_shadow: bool,
 }
 
 impl Default for Config {
@@ -58,6 +63,7 @@ pub fn parse(bytes: &[u8]) -> Result<Config, String> {
     let mut rate = None;
     let mut workers = None;
     let mut routed = None;
+    let mut shadow = None;
     let mut err = None;
     ini::parse(bytes, |k, v| {
         if err.is_some() {
@@ -105,6 +111,13 @@ pub fn parse(bytes: &[u8]) -> Result<Config, String> {
                     })
                     .collect::<Result<Vec<u32>, String>>()?;
                 routed = Some(hashes);
+            } else if k.eq_ignore_ascii_case(b"cells_shadow") {
+                let s = text("cells_shadow", v)?;
+                shadow = Some(match s.to_ascii_lowercase().as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => return Err(format!("mercs2_profiler.ini: cells_shadow = {s:?} is not on or off")),
+                });
             } else {
                 return Err(format!("mercs2_profiler.ini: unknown key {:?}", String::from_utf8_lossy(k)));
             }
@@ -122,8 +135,9 @@ pub fn parse(bytes: &[u8]) -> Result<Config, String> {
     let sample_rate_hz = rate.ok_or("mercs2_profiler.ini: sample_rate_hz is missing")?;
     let job_workers = workers.ok_or("mercs2_profiler.ini: job_workers is missing")?;
     let route_jobtypes = routed.ok_or("mercs2_profiler.ini: route_jobtypes is missing")?;
+    let cells_shadow = shadow.ok_or("mercs2_profiler.ini: cells_shadow is missing")?;
     route::check(job_workers, &route_jobtypes).map_err(|e| format!("mercs2_profiler.ini: {e}"))?;
-    Ok(Config { hotkey_name, hotkey, capture_service, sample_rate_hz, job_workers, route_jobtypes })
+    Ok(Config { hotkey_name, hotkey, capture_service, sample_rate_hz, job_workers, route_jobtypes, cells_shadow })
 }
 
 /// Write the default file at `path` when there is none; `true` when it was written.
@@ -154,27 +168,35 @@ mod tests {
         assert_eq!(c.sample_rate_hz, 250);
         assert_eq!(c.job_workers, 1);
         assert!(c.route_jobtypes.is_empty());
+        assert!(!c.cells_shadow);
         assert!(DEFAULT_INI.is_ascii());
     }
 
     #[test]
     fn keys_are_case_insensitive_and_modifiers_parse() {
         let c = parse(
-            b"HotKey = ctrl+F12\r\nCAPTURE_SERVICE=10.0.0.2:9000\r\nSample_Rate_Hz = 1000\r\nJob_Workers = 0\r\nROUTE_JOBTYPES = \r\n",
+            b"HotKey = ctrl+F12\r\nCAPTURE_SERVICE=10.0.0.2:9000\r\nSample_Rate_Hz = 1000\r\nJob_Workers = 0\r\nROUTE_JOBTYPES = \r\nCells_Shadow = On\r\n",
         )
         .unwrap();
         assert_eq!(c.hotkey, KeySpec { vk: Some(vk::F1 + 11), mods: Mods::CTRL });
         assert_eq!(c.capture_service, "10.0.0.2:9000".parse().unwrap());
         assert_eq!(c.sample_rate_hz, 1000);
         assert_eq!(c.job_workers, 0);
+        assert!(c.cells_shadow);
     }
 
     #[test]
     fn every_problem_is_an_error_naming_the_key() {
-        const JOBS: &str = "job_workers = 1\nroute_jobtypes =\n";
-        const REST: &str = "capture_service = 127.0.0.1:1\nsample_rate_hz = 1000\njob_workers = 1\nroute_jobtypes =\n";
+        const JOBS: &str = "job_workers = 1\nroute_jobtypes =\ncells_shadow = off\n";
+        const REST: &str = "capture_service = 127.0.0.1:1\nsample_rate_hz = 1000\njob_workers = 1\nroute_jobtypes =\ncells_shadow = off\n";
         let with = |s: &str| parse(format!("{s}{REST}").as_bytes());
-        let base = |s: &str| parse(format!("hotkey = F5\ncapture_service = 127.0.0.1:1\nsample_rate_hz = 1\n{s}").as_bytes());
+        let base = |s: &str| parse(format!("hotkey = F5\ncapture_service = 127.0.0.1:1\nsample_rate_hz = 1\ncells_shadow = off\n{s}").as_bytes());
+        assert!(base("job_workers = 1\nroute_jobtypes =\ncells_shadow = maybe\n").unwrap_err().contains("not on or off"));
+        assert!(
+            parse(b"hotkey = F5\ncapture_service = 127.0.0.1:1\nsample_rate_hz = 1\njob_workers = 1\nroute_jobtypes =\n")
+                .unwrap_err()
+                .contains("cells_shadow is missing")
+        );
         assert!(with("hotkey = F99\n").unwrap_err().contains("names no key"));
         assert!(parse(format!("hotkey = F5\ncapture_service = localhost:1\nsample_rate_hz = 1\n{JOBS}").as_bytes()).unwrap_err().contains("capture_service"));
         assert!(with("hotkey = F5\nport = 3\n").unwrap_err().contains("unknown key \"port\""));
