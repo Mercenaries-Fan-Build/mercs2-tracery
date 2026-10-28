@@ -1,75 +1,57 @@
-# Jobtype `0xECAED415` — the per-cell distance test
+# Jobtype `0xECAED415` — the per-cell sub-slot LOD test
 
-The game posts this jobtype about 625 times per frame on the main thread; it is the single largest job
-in a frame (~13 µs each, ~8.5 ms per frame in the 2026-10-24 capture). This note is the port's spec: what
-the job reads, what it writes, which pieces are concurrency-safe as the game ships them, and what the
-port has to do to run several copies at once.
+The game posts this jobtype about 625 times per frame on the main thread; it is the single largest
+leaf of the frame graph (8.4 ms of a 20261026 CrossOver frame). The profiler ASI carries a Rust port
+of it (`client/src/cells.rs`) and runs that port as the jobtype's handler (`client/src/live.rs`).
+This note says what the handler reads, what it writes, and how the ASI replaces it. The decode of
+the arithmetic — cascade, hysteresis, fade cutoff, struct layouts — is
+`docs/reverse_engineer/pimp_job_system_code_map.md` §9; the side effects a replacement must
+reproduce are §9.9.
 
-Addresses are v1.0 (`mercs2_unpacked.exe`, sha256 `8c179a99…`). The v1.1 counterparts are listed in the
-site table at the bottom.
+Addresses are v1.1 (`v11-patched-securom`, image `pc-v11`); §9.1 lists the v1.0 counterparts.
 
 ## Dispatch
 
-**Jobtype hash:** `0xECAED415`. **Handler:** `FUN_00735C80`.
+Handler `FUN_00735E80`, slot 17 of the per-CPU handler tables. No parameters: the handler reads
+the current job element through the thread's Pimp control block (`TLS[0] + 0xC`), where `+0x0C`,
+`+0x10`, `+0x14` sum to the index of the slot after the cells in the element's pointer table at
+`+0x20`. The cells are the pointers before that slot; the config block and the reference-point
+block are the two pointers after it (§9.2).
 
-The job is registered at build time with handler slot `_DAT_00D1CD74`; the per-tile dispatcher at
-`FUN_005165C9` enqueues one instance per draw tile. The job struct the handler reads through TLS+0xC is
-the standard Pimp parameter block.
+## What the handler writes
 
-## What the handler reads
+| Target | When | Lock |
+|---|---|---|
+| Four globals (`0x00F78524` cfg, `0x00F7851C` reference block, `0x00F78520` cell size, `0x01175260`) | once, before the cell loop | none |
+| One 16-byte entry on the change ring (`0x00DD4790`, counter `0x00DD4788`) per changed sub-slot: `entity_id`, `old \| new << 8`, 8 bytes of stack residue | as each slot changes | `CRITICAL_SECTION` `0x00DD4770`, per push |
+| The slot's state byte `cell[0x80 + i]` | after the push, outside the lock | none |
 
-The handler walks its job struct to find one entry in a per-slot table, then unpacks four values from that
-entry. In the shipped build these go into globals so the inner functions can read them without taking
-pointer arguments. The port passes them as arguments instead.
+The four globals are read only inside the handler's own chain; the residue bytes are copied once
+(`FUN_00518890` → `0x019C50F8`) and never read; the ring has no capacity check (§9.9).
 
-| Game global      | Role                                             | Port argument          |
-|------------------|--------------------------------------------------|------------------------|
-| `0x00F79524`     | config block for this slot (read-only)           | `Inputs::config`       |
-| `0x00F7951C`     | output buffer base, indexed per cell             | `Inputs::output`       |
-| `0x00F79520`     | `2.0 << (shift - 1)` as a float, from `cfg[+4]`  | `Inputs::cell_size`    |
-| `0x01176260`     | viewpoint position (`float[3]`)                  | `Inputs::viewpoint`    |
+## How the ASI replaces it
 
-The handler then iterates over the slot's cell list and calls the per-cell test for each entry.
+`cells_shadow = off` in `mercs2_profiler.ini` (the default): the trampoline the ASI installs in the
+jobtype's slot (`client/src/jobs.rs`) calls `live::game::run` instead of `FUN_00735E80`. That walks
+the job element as the dispatcher does (`live::walk_tls_job`), runs `cells::job_17_run` with a
+`LiveSink` that pushes each changed slot's entry under the game's critical section — the lock object
+is `counter − 0x18`, from the resolved `CellsChangeRing` site — with zeros in the residue bytes, and
+stores the cell's state bytes when the cell is done. It writes no globals: nothing reads them when
+the chain does not run. The port takes its inputs as arguments and writes nothing shared outside the
+ring, so it is re-entrant.
 
-## What the port writes
-
-Every sub-slot visited gets a LOD classification byte (one of `0x10`, `0x20`, `0x30`, `0x40`). When the new
-byte differs from the old, the change is appended to a critical-section-guarded ring at `0xDD5770 /
-0xDD5790 / 0xDD5788`. That ring is shared across every thread that runs the job; the ring's own lock takes
-care of concurrent appends, so the port keeps using it rather than keeping its own.
-
-## Shared-mutable state
-
-| Address            | Written by job       | Shared?      | Port strategy |
-|--------------------|----------------------|--------------|---------------|
-| `0xF79524/1C/20`   | handler (one-shot)   | yes (globals) | passed as args; port never writes them |
-| `0x1176260`        | handler (one-shot)   | yes (global) | passed as arg; port never writes it |
-| cell state bytes   | per-cell loop        | per cell     | one cell per thread, no contention |
-| `0xDD5790` ring    | per change           | shared       | reuse the game's CS at `0xDD5770` |
-
-Everything except the four handler-level globals is already safe for several concurrent cells (the ring is
-locked, the cell state is per-cell, the config and viewpoint are read-only). Taking the globals off is the
-whole point of the port.
+`cells_shadow = on`: the game's handler runs, and `client/src/shadow.rs` runs the port beside every
+invocation on the same inputs into a buffer, compares that with the ring entries the handler wrote,
+and logs each difference with the cell, the slot and the slot's arithmetic. This is the regression
+check for the port; it pays for both handlers. On CrossOver run it with `sample_rate_hz = 1`
+(memory `crossover-sampler-corrupts-x87`).
 
 ## Site table
 
-| v1.0        | v1.1        | Role                                            |
-|-------------|-------------|-------------------------------------------------|
-| `0x00735C80`| `0x00735E80`| Handler entry (`cells::run` replacement)        |
-| `0x00735BD0`| TBD         | Per-cell test (inner, called from the handler)  |
-| `0x00735640`| TBD         | Core per-sub-slot loop                          |
-| `0x00735580`| TBD         | AABB distance helper                            |
-| `0x005186F0`| TBD         | Change-list append helper                       |
-| `0x00DD5770`| TBD         | Change-list `CRITICAL_SECTION`                  |
+| Site | What the ASI takes from it |
+|---|---|
+| `JobRegister` (`0x0084B230`) | the jobtype count and the two handler tables; slot 17 is wrapped like every other |
+| `CellsChangeRing` (`0x00735AEF`) | the counter and ring base; the lock object is `counter − 0x18` (`CellsChangeRing::critical_section`) |
 
-The v1.1 addresses are not yet pinned by signature; the port only needs the handler VA, which the profiler
-already resolves (`JobRegister` site + slot 17 of the handler table).
-
-## Order of operations for the port
-
-1. **Done:** scaffold (`src/cells.rs`), interface, tests, this doc.
-2. Record cases: a mode of the profiler captures the inputs the game sees + the changes it writes, one
-   `.jobcase` entry per invocation.
-3. Port one small, exact piece at a time (the AABB helper first), verified against recorded cases.
-4. Grow the port until a chosen capture matches the game cell-for-cell.
-5. Route the jobtype through workers running the port.
+Both resolve by byte pattern (`mercs2_formats::profiler_sites`), so the ASI needs no per-build
+addresses.
