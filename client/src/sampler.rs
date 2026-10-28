@@ -14,11 +14,12 @@
 //! committed (the stack grew through it), so it reads only mapped memory. The time each thread is held
 //! suspended is measured (total and longest), so a session reports what the sampler cost the game.
 
+use crate::samples_stream::Sender;
 use crate::threads;
 use core::ffi::c_void;
 use mercs2_formats::prof_samples::{FLAG_EXITED, FLAG_SCAN_LIMIT, Header, Record};
-use mercs2_formats::profd::{LINE_MAX, Reply, Request};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use mercs2_formats::profd::{LINE_MAX, Reply};
+use std::io::{BufRead, BufReader, Read};
 use std::net::{Shutdown, SocketAddrV4, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -194,9 +195,8 @@ pub fn start(
     let encoded = header.encode()?;
     let stream = TcpStream::connect_timeout(&addr.into(), CONNECT)
         .map_err(|e| format!("the capture service at {addr} did not accept the samples stream: {e}"))?;
-    let mut w = BufWriter::with_capacity(256 * 1024, stream.try_clone().map_err(|e| format!("cloning the samples stream: {e}"))?);
-    w.write_all(Request::Samples { session: session.to_owned() }.line().as_bytes()).map_err(|e| format!("opening the samples stream: {e}"))?;
-    w.write_all(&encoded).map_err(|e| format!("writing the samples header: {e}"))?;
+    let mut w = Sender::new(stream.try_clone().map_err(|e| format!("cloning the samples stream: {e}"))?);
+    w.open(session, &encoded)?;
     let stop = Arc::new(AtomicBool::new(false));
     let s = stop.clone();
     let join = std::thread::Builder::new()
@@ -217,7 +217,7 @@ struct Held {
 
 fn run(
     stream: TcpStream,
-    mut w: BufWriter<TcpStream>,
+    mut w: Sender<TcpStream>,
     header: Header,
     targets: Vec<Target>,
     period: Duration,
@@ -256,7 +256,7 @@ fn run(
                 };
                 rec.encode_into(&mut out);
             }
-            w.write_all(&out).map_err(|e| format!("sending samples: {e}"))?;
+            w.tick(&out)?;
             out.clear();
             tick = tick.wrapping_add(1);
             next += period;
@@ -268,7 +268,7 @@ fn run(
                 next = now;
             }
         }
-        w.flush().map_err(|e| format!("sending samples: {e}"))
+        Ok(())
     })();
     if let Err(e) = sampled {
         // End the stream at once, so the service closes the file and accepts STOP.
