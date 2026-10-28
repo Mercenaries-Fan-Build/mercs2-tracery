@@ -10,7 +10,9 @@ pub mod crash;
 pub mod shadow;
 pub mod cpu;
 pub mod jobs;
+pub mod live;
 pub mod route;
+pub mod samples_stream;
 pub mod session;
 
 #[cfg(all(windows, target_arch = "x86"))]
