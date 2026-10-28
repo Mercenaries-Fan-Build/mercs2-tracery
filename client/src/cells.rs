@@ -12,10 +12,10 @@
 //!
 //! # Verification
 //!
-//! The port is not swapped in until it matches the original. The profiler can be built in a mode that, for
-//! every job 17 the game dispatches, snapshots the inputs, lets the original run, then re-runs the port
-//! against a copy of the inputs into a shadow change-list and compares it to what the original wrote. A
-//! mismatch is a fatal error naming the cell and sub-slot. See [`verify`].
+//! [`crate::live`] runs the port as the jobtype's handler. With `cells_shadow = on` the game's handler runs
+//! instead and [`crate::shadow`] runs the port beside every invocation on the same inputs, comparing its
+//! changes with the ring entries the game wrote; a difference is logged with the cell, the slot and the
+//! slot's arithmetic.
 
 
 /// What the per-cell loop writes: a cell slot's new LOD byte, from its old byte, together with the slot's
@@ -80,10 +80,13 @@ pub struct Cell(pub [u8; 0x1f0]);
 /// - `cell[0x1A0 + i*2]` LOD base word (0x1A0..0x1E0)
 /// - `cell[0x1E4]` sub_slot_count (i16); `cell[0x1E6]` cell_id (i16)
 impl Cell {
+    /// Where the state bytes start: `cell[STATE_AT + i]` is sub-slot `i`'s.
+    pub const STATE_AT: usize = 0x80;
+
     pub fn sub_slot_count(&self) -> i16 { self.i16(0x1e4) }
     pub fn cell_id(&self) -> i16 { self.i16(0x1e6) }
     pub fn entity_id(&self, i: usize) -> u32 { self.u32(i * 4) }
-    pub fn state(&self, i: usize) -> u8 { self.0[0x80 + i] }
+    pub fn state(&self, i: usize) -> u8 { self.0[Self::STATE_AT + i] }
     /// Low byte of the sub-slot record (`cell[0xA0 + i*4]`): the sub-slot's X byte coordinate.
     pub fn sub_slot_x_byte(&self, i: usize) -> u8 { self.0[0xA0 + i * 4] }
     /// Second byte of the sub-slot record (`cell[0xA1 + i*4]`): the sub-slot's Y byte coordinate.
@@ -110,9 +113,9 @@ impl Cell {
 pub enum SlotOutcome {
     /// The sub-slot was culled (distance key below the fade threshold); state becomes 0.
     Faded,
-    /// LOD bits accumulated but no 0x10..0x40 band was set — the loop should `continue` without writing.
-    NoBand,
-    /// A new state byte: emit a change if it differs from the current state.
+    /// The new state byte, which may carry no band at all: emit a change if it differs from the
+    /// current state, and store it either way. The game never skips this store — see
+    /// [`per_sub_slot`] on the no-band path.
     Band(u8),
 }
 
@@ -175,15 +178,43 @@ pub struct SlotContext<'a> {
     pub fade_threshold: i32,
 }
 
-/// The per-sub-slot computation inside `FUN_00735640`'s main loop. Does not touch global state; the caller
-/// emits any change entries via a [`Sink`].
-pub fn per_sub_slot(ctx: &SlotContext<'_>, cell: &Cell, i: usize) -> SlotOutcome {
+/// Every intermediate of one sub-slot's evaluation, so a live mismatch can be explained from the
+/// numbers rather than re-derived. [`per_sub_slot`] is a thin wrapper over [`slot_math`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlotMath {
+    pub packed: i32,
+    pub faded: bool,
+    pub sub_x: f32,
+    pub sub_z: f32,
+    pub sub_y: f32,
+    pub inner_sq: f32,
+    pub outer_sq: f32,
+    pub near_2d_sq: f32,
+    pub near_3d_sq: f32,
+    /// The inner-reference bits accumulated before any band is chosen.
+    pub bits: u8,
+    pub ungated_near: bool,
+    /// The byte the slot ends with: bits, band, and the no-band tier-0x10 keep.
+    pub new: u8,
+}
+
+impl SlotMath {
+    /// One line of the numbers that decide the outcome.
+    pub fn describe(&self) -> String {
+        format!(
+            "packed {} faded {} sub ({:.2},{:.2},{:.2}) inner² {:.1} outer² {:.1} near2d² {:.1} near3d² {:.1} bits {:#04x} ungated {} new {:#04x}",
+            self.packed, self.faded, self.sub_x, self.sub_y, self.sub_z, self.inner_sq, self.outer_sq, self.near_2d_sq, self.near_3d_sq, self.bits, self.ungated_near, self.new
+        )
+    }
+}
+
+/// The per-sub-slot computation inside `FUN_00735640`'s main loop, with every intermediate kept.
+/// Does not touch global state.
+pub fn slot_math(ctx: &SlotContext<'_>, cell: &Cell, i: usize) -> SlotMath {
     let key = cell.sub_slot_key(i);
     let old = cell.state(i);
     let packed = (key & 0x3fff) as i32;
-    if packed < ctx.fade_threshold {
-        return SlotOutcome::Faded;
-    }
+    let faded = packed < ctx.fade_threshold;
 
     let cfg = ctx.cfg;
     let sub_step = cfg.sub_step();
@@ -201,6 +232,10 @@ pub fn per_sub_slot(ctx: &SlotContext<'_>, cell: &Cell, i: usize) -> SlotOutcome
     let mut acc: u8 = 0;
     let mut near_2d_sq = EMPTY;
     let mut near_3d_sq = EMPTY;
+    // `var_23h` in `FUN_00735840` (v1.1): zeroed per sub-slot at 0x007359bd, set to 1 at 0x00735aa9 when
+    // a reference point passes the distance test but its gate is zero. It is read on the no-band path
+    // only.
+    let mut ungated_near = false;
     let inner_count = cfg.inner_count().max(0) as usize;
     for j in 0..inner_count {
         let idx = cfg.inner_indices()[j];
@@ -220,18 +255,83 @@ pub fn per_sub_slot(ctx: &SlotContext<'_>, cell: &Cell, i: usize) -> SlotOutcome
                 if sq_3d < near_3d_sq {
                     near_3d_sq = sq_3d;
                 }
+            } else {
+                ungated_near = true;
             }
         }
     }
+    let bits = acc;
 
     if near_2d_sq < outer_sq {
         acc |= select_lod_band(near_2d_sq, near_3d_sq, inner_sq, cell.lod_bytes(i), cell.lod_base(i), cfg.margin(), old);
     }
 
-    if (acc & 0xf0) == 0 {
-        return SlotOutcome::NoBand;
+    // No band: the game does not skip the slot. At 0x00735cb4 `test bl, 0xf0; jne` falls to the
+    // SecuROM-relocated `0x00581bf6: cmp byte [var_23h], 0; jmp 0x00735cbe`, and 0x00735cbe is
+    // `je compare; or bl, 0x10`, so an ungated near reference keeps tier 0x10 and the byte then goes
+    // through the same compare-and-store as a band. An earlier reading of this port treated the
+    // relocated block as a `continue` and emitted nothing here; every one of the 588 shadow-run
+    // mismatches was a game-only `old -> 0x00` from exactly this path with `acc == 0`.
+    if (acc & 0xf0) == 0 && ungated_near {
+        acc |= 0x10;
     }
-    SlotOutcome::Band(acc)
+    SlotMath { packed, faded, sub_x, sub_z, sub_y, inner_sq, outer_sq, near_2d_sq, near_3d_sq, bits, ungated_near, new: acc }
+}
+
+/// The per-sub-slot outcome: the fade check first, else the byte [`slot_math`] ends with. The caller
+/// emits any change entries via a [`Sink`].
+pub fn per_sub_slot(ctx: &SlotContext<'_>, cell: &Cell, i: usize) -> SlotOutcome {
+    let m = slot_math(ctx, cell, i);
+    if m.faded { SlotOutcome::Faded } else { SlotOutcome::Band(m.new) }
+}
+
+/// The fade cutoff input for one cell: `FUN_00735780`'s group-min over the cell's outer-grid box, as
+/// `FUN_00735DD0` computes it before calling the body. `None` when the outer grid is unset.
+pub fn cell_threshold(cell: &Cell, cfg: &Config, arr: &DistanceBlock) -> Option<f32> {
+    let outer = cfg.outer_grid_width();
+    if outer <= 0 {
+        return None;
+    }
+    let cell_size = (2u32 << u32::from(cfg.shift()).saturating_sub(1)) as f32;
+    let cell_id = cell.cell_id();
+    let row = i32::from(cell_id) / i32::from(outer);
+    let col = i32::from(cell_id) - row * i32::from(outer);
+    let world_x = cfg.origin_x() + (col as f32) * cell_size;
+    let world_z = cfg.origin_z() + (row as f32) * cell_size;
+    let bb = Box2D { xmin: world_x, zmin: world_z, xmax: world_x + cell_size, zmax: world_z + cell_size };
+    let mut out = [0.0f32; 4];
+    Some(cell_group_min(&mut out, arr, &bb))
+}
+
+/// The context `FUN_00735840` builds for one cell from a group-min `threshold`: the cell's world
+/// position from `grid_dim`/`cell_step`, and the fade cutoff `trunc(threshold - margin)`. `None` when
+/// `grid_dim` is unset.
+pub fn slot_context<'a>(cell: &Cell, cfg: &'a Config, arr: &'a DistanceBlock, threshold: f32) -> Option<SlotContext<'a>> {
+    let grid_dim = cfg.grid_dim();
+    if grid_dim <= 0 {
+        return None;
+    }
+    let cell_id = cell.cell_id();
+    let row = i32::from(cell_id) / i32::from(grid_dim);
+    let col = i32::from(cell_id) - i32::from(grid_dim) * row;
+    let step = cfg.cell_step();
+    let world_x = cfg.origin_x() + (col * step) as f32;
+    let world_z = cfg.origin_z() + (row * step) as f32;
+    // Fade threshold: the group min, minus `margin`, truncated toward zero. Read off the instruction
+    // stream at 0x007358ba, because the decompile models only one parameter of `FUN_00735840` and so
+    // loses the float second argument entirely:
+    //
+    //   fld   dword [ebp + 0xc]     ; arg2 = FUN_00735780's group min, pushed by the caller at
+    //                               ;        0x00735e6e (`fstp dword [esp]` straight off ST0)
+    //   fsub  dword [esi + 0x3c]    ; minus cfg+0x3c == margin
+    //   fstp  dword [esp + 0x1c]
+    //   fld   dword [esp + 0x1c]
+    //   call  0x9ee870              ; the CRT's truncating float -> int64
+    //
+    // The margin term was briefly removed here on the theory that it was invented, since nothing in
+    // the decompile showed it. That was wrong: it is real, and these five instructions are why.
+    let fade_threshold = (threshold - cfg.margin()) as i32;
+    Some(SlotContext { cfg, arr, world_x, world_z, fade_threshold })
 }
 
 /// `FUN_00735BD0` + `FUN_00735C80` port: iterate every cell this job invocation covers, compute each cell's
@@ -240,27 +340,18 @@ pub fn per_sub_slot(ctx: &SlotContext<'_>, cell: &Cell, i: usize) -> SlotOutcome
 ///
 /// `cell_size` is `2 << (cfg.shift() - 1)` as `f32`, which the handler normally caches in a global
 /// (`DAT_00F79520`); the port recomputes it from `cfg` so no global state is needed.
+///
+/// Ghidra renders the no-band case in `FUN_00735840` as `(bVar20 & 0xf0) == 0 -> FUN_00581bf6();
+/// return;`. `0x581bf6` is a SecuROM-relocated fragment, not a call target: it tests the ungated-near
+/// flag and jumps back into the slot's compare-and-store (see [`per_sub_slot`]). The cell is neither
+/// abandoned nor is the slot skipped.
 pub fn job_17_run<S: Sink>(cells: &[&Cell], cfg: &Config, arr: &DistanceBlock, sink: &mut S) {
-    let outer = cfg.outer_grid_width();
-    if outer <= 0 {
-        return;
-    }
-    let shift = cfg.shift();
-    // `2 << (shift - 1)` as `f32`. The game computes it with `shl edx, cl; fild [esp]` so the result is
-    // integer-exact for any `shift <= 31`; saturating_sub guards the undefined `shl` by `-1` case.
-    let cell_size = (2u32 << u32::from(shift).saturating_sub(1)) as f32;
-    let origin_x = cfg.origin_x();
-    let origin_z = cfg.origin_z();
-    for cell in cells {
-        let cell_id = cell.cell_id();
-        let row = i32::from(cell_id) / i32::from(outer);
-        let col = i32::from(cell_id) - row * i32::from(outer);
-        let world_x = origin_x + (col as f32) * cell_size;
-        let world_z = origin_z + (row as f32) * cell_size;
-        let bb = Box2D { xmin: world_x, zmin: world_z, xmax: world_x + cell_size, zmax: world_z + cell_size };
-        let mut out = [0.0f32; 4];
-        let threshold = cell_group_min(&mut out, arr, &bb);
+    // `2 << (shift - 1)` as `f32` inside `cell_threshold`: the game computes it with
+    // `shl edx, cl; fild [esp]` so the result is integer-exact for any `shift <= 31`.
+    for (i, cell) in cells.iter().enumerate() {
+        let Some(threshold) = cell_threshold(cell, cfg, arr) else { return };
         per_cell_test(cell, cfg, arr, threshold, sink);
+        sink.cell_done(i);
     }
 }
 
@@ -268,46 +359,36 @@ pub fn job_17_run<S: Sink>(cells: &[&Cell], cfg: &Config, arr: &DistanceBlock, s
 /// the group-min threshold, then walks each sub-slot and emits a [`Change`] when the state transitions.
 ///
 /// This is a pure function: it reads `cell`, `cfg`, `arr`, writes to `sink`, and does not touch the game's
-/// globals. The caller is responsible for committing new states back onto the cell (the game does this
-/// inline inside the critical section; verification mode defers it until the records are compared).
+/// globals. The sink is responsible for committing new states back onto the cell: the game stores each
+/// slot's byte right after its push (`0x00735D39`, `0x0073597A`), and no slot reads another's state, so
+/// a sink that stores them when the cell is done ([`Sink::cell_done`]) leaves the cell as the game would.
 pub fn per_cell_test<S: Sink>(cell: &Cell, cfg: &Config, arr: &DistanceBlock, threshold: f32, sink: &mut S) {
-    let cell_id = cell.cell_id();
-    let grid_dim = cfg.grid_dim();
-    if grid_dim <= 0 {
-        return;
-    }
-    let row = i32::from(cell_id) / i32::from(grid_dim);
-    let col = i32::from(cell_id) - i32::from(grid_dim) * row;
-    let step = cfg.cell_step();
-    let world_x = cfg.origin_x() + (col * step) as f32;
-    let world_z = cfg.origin_z() + (row * step) as f32;
-    // Fade threshold: `(threshold - margin)` truncated toward zero (the game's `cvttsd2si`).
-    let fade_threshold = (threshold - cfg.margin()) as i32;
-
-    let ctx = SlotContext { cfg, arr, world_x, world_z, fade_threshold };
+    let Some(ctx) = slot_context(cell, cfg, arr, threshold) else { return };
     let count = cell.sub_slot_count().max(0) as usize;
     for i in 0..count {
         let old = cell.state(i);
         match per_sub_slot(&ctx, cell, i) {
             SlotOutcome::Faded => {
                 if old != 0 {
-                    sink.push(Change { entity_id: cell.entity_id(i), old_new: u16::from(old), extra: [0, 0] });
+                    sink.push(i, Change { entity_id: cell.entity_id(i), old_new: u16::from(old), extra: [0, 0] });
                 }
             }
-            SlotOutcome::NoBand => {}
             SlotOutcome::Band(new) => {
                 if old != new {
-                    sink.push(Change { entity_id: cell.entity_id(i), old_new: u16::from(old) | (u16::from(new) << 8), extra: [0, 0] });
+                    sink.push(i, Change { entity_id: cell.entity_id(i), old_new: u16::from(old) | (u16::from(new) << 8), extra: [0, 0] });
                 }
             }
         }
     }
 }
 
-/// Where the port writes its results. In production this is the game's live change-list; in verification it
-/// is a shadow buffer, which [`verify`] compares against the game's recorded one.
+/// Where the port writes its results: the game's change ring and the cells' state bytes when the port is
+/// the handler ([`crate::live`]), a buffer compared against the game's ring in shadow mode.
 pub trait Sink {
-    fn push(&mut self, c: Change);
+    /// Sub-slot `slot` of the cell being tested changed: `c` is its ring entry.
+    fn push(&mut self, slot: usize, c: Change);
+    /// Every sub-slot of cell `cell` (its index in the slice given to [`job_17_run`]) has been tested.
+    fn cell_done(&mut self, cell: usize);
 }
 
 /// The "infinity" sentinel the inner helpers use when a slot is empty (`DAT_00BEA9AC = 0x7F7FFFFF`, which is
@@ -410,9 +491,11 @@ pub fn cell_group_min(out: &mut [f32; 4], block: &DistanceBlock, b: &Box2D) -> f
 pub struct RecordingSink(pub Vec<Change>);
 
 impl Sink for RecordingSink {
-    fn push(&mut self, c: Change) {
+    fn push(&mut self, _slot: usize, c: Change) {
         self.0.push(c);
     }
+
+    fn cell_done(&mut self, _cell: usize) {}
 }
 
 #[cfg(test)]
@@ -422,8 +505,8 @@ mod tests {
     #[test]
     fn a_recording_sink_collects_the_changes_in_order() {
         let mut s = RecordingSink::default();
-        s.push(Change { entity_id: 0x1234_5678, old_new: 0x1020, extra: [1, 2] });
-        s.push(Change { entity_id: 0x9abc_def0, old_new: 0x2030, extra: [3, 4] });
+        s.push(0, Change { entity_id: 0x1234_5678, old_new: 0x1020, extra: [1, 2] });
+        s.push(1, Change { entity_id: 0x9abc_def0, old_new: 0x2030, extra: [3, 4] });
         assert_eq!(s.0.len(), 2);
         assert_eq!(s.0[0].entity_id, 0x1234_5678);
         assert_eq!(s.0[1].old_new, 0x2030);
@@ -675,6 +758,69 @@ mod tests {
         assert_eq!(sink.0[1].old_new, 0x0040); // old=0x40, new=0 (fade)
     }
 
+    /// The fade cutoff is `group_min - margin`, truncated — proven from the instructions at
+    /// 0x007358ba (`fld [ebp+0xc]; fsub [esi+0x3c]`), which the decompile cannot show because it
+    /// models only one parameter of `FUN_00735840`. A key inside `[cutoff, group_min)` must therefore
+    /// NOT fade; treating the bare group min as the cutoff invents fades the game never emits.
+    #[test]
+    fn per_cell_test_subtracts_the_margin_from_the_group_min_to_get_the_fade_cutoff() {
+        // margin = 5.0, inner_scale = 10.0; reference 0 is present but UNGATED, so a slot it is near
+        // cannot get a band and instead keeps tier 0x10 through the no-band store. That makes the
+        // two outcomes for key 12 distinguishable: not faded -> 0x40 -> 0x11; faded -> 0x40 -> 0x00.
+        let cfg = CfgBuild { grid_dim: 1, inner_count: 1, cell_step: 100, sub_step: 1.0, inner_scale: 10.0, margin: 5.0, gates: [0, 0, 0, 0], indices: [0, 0, 0, 0], ..Default::default() }.build();
+        let mut cell = mk_cell(0, 2);
+        // key 12 is below the group min (15) but at/above the real cutoff (15 - 5 = 10): not faded.
+        Slot { entity_id: 0x3333, state: 0x40, key: 12, x_byte: 10, y_byte: 20, lod_bytes: (1, 1, 1), ..Default::default() }
+            .write_to(&mut cell, 0);
+        // key 9 is below the cutoff, so it must still fade.
+        Slot { entity_id: 0x4444, state: 0x40, key: 9, lod_bytes: (1, 1, 1), ..Default::default() }.write_to(&mut cell, 1);
+        let arr = mk_arr([Point { x: 10.0, y: 0.0, z: 20.0 }, Point::default(), Point::default(), Point::default()]);
+        let mut sink = RecordingSink::default();
+        per_cell_test(&cell, &cfg, &arr, 15.0, &mut sink);
+        assert_eq!(sink.0.len(), 2);
+        assert_eq!(sink.0[0].entity_id, 0x3333);
+        assert_eq!(sink.0[0].old_new, 0x1140, "key 12 is not faded: it keeps tier 0x10 from the ungated reference (a bare cutoff would give 0x0040)");
+        assert_eq!(sink.0[1].entity_id, 0x4444);
+        assert_eq!(sink.0[1].old_new, 0x0040, "key 9 fades: old -> 0x00");
+    }
+
+    /// `FUN_00735840` 0x00735cb4..0x00735cc7: a sub-slot that ends up with no band is not skipped. Its
+    /// accumulated byte goes through the same compare-and-store as a band, so a slot that held `0x11`
+    /// and now has no reference near it emits `0x11 -> 0x00` and is stored as `0x00`. This was the
+    /// whole of the shadow-run residue (588 game-only `old -> 0x00` entries, zero port-only).
+    #[test]
+    fn per_cell_test_stores_and_emits_a_no_band_byte_when_it_differs_from_the_old_state() {
+        let cfg = basic_cfg(1, 100, 0.0, 0.0);
+        let mut cell = mk_cell(0, 2);
+        // Slot 0 held band 0x10 + inner bit 0; nothing is near it now, so acc == 0.
+        Slot { entity_id: 0x5555, state: 0x11, x_byte: 10, y_byte: 20, key: 100, lod_bytes: (1, 1, 1), ..Default::default() }
+            .write_to(&mut cell, 0);
+        // Slot 1 had no state and gets none: equal bytes, nothing emitted.
+        Slot { entity_id: 0x6666, state: 0x00, x_byte: 10, y_byte: 20, key: 100, lod_bytes: (1, 1, 1), ..Default::default() }
+            .write_to(&mut cell, 1);
+        let arr = mk_arr([Point { x: 100_000.0, y: 0.0, z: 100_000.0 }, Point::default(), Point::default(), Point::default()]);
+        let mut sink = RecordingSink::default();
+        per_cell_test(&cell, &cfg, &arr, 0.0, &mut sink);
+        assert_eq!(sink.0.len(), 1, "only the slot whose byte changed emits");
+        assert_eq!(sink.0[0].entity_id, 0x5555);
+        assert_eq!(sink.0[0].old_new, 0x0011, "old 0x11 -> new 0x00");
+    }
+
+    /// `var_23h`: a reference that passes the distance test with its gate at zero sets the flag
+    /// (0x00735aa9), and on the no-band path the flag keeps tier 0x10 (`or bl, 0x10` at 0x00735cc0).
+    #[test]
+    fn an_ungated_near_reference_keeps_tier_0x10_on_the_no_band_path() {
+        // Gate for reference 0 is OFF, so it never feeds the distance trackers and no band can be
+        // picked; but it is inside the inner radius, so the flag is set and the inner bit is OR'd in.
+        let cfg = CfgBuild { grid_dim: 1, inner_count: 1, cell_step: 100, sub_step: 1.0, inner_scale: 10.0, margin: 5.0, gates: [0, 0, 0, 0], indices: [0, 0, 0, 0], ..Default::default() }.build();
+        let mut cell = mk_cell(0, 1);
+        Slot { entity_id: 0x7777, state: 0x00, x_byte: 10, y_byte: 20, key: 100, lod_bytes: (1, 1, 1), ..Default::default() }
+            .write_to(&mut cell, 0);
+        let arr = mk_arr([Point { x: 10.0, y: 0.0, z: 20.0 }, Point::default(), Point::default(), Point::default()]);
+        let ctx = SlotContext { cfg: &cfg, arr: &arr, world_x: 0.0, world_z: 0.0, fade_threshold: 0 };
+        assert_eq!(per_sub_slot(&ctx, &cell, 0), SlotOutcome::Band(0x11), "tier 0x10 from the flag, bit 0 from the reference");
+    }
+
     #[test]
     fn job_17_run_does_nothing_when_the_outer_grid_width_is_zero() {
         let cfg = basic_cfg(1, 100, 0.0, 0.0); // outer_grid_width = 0 (default)
@@ -703,6 +849,36 @@ mod tests {
         assert_eq!(sink.0[1].entity_id, 0x0002);
     }
 
+    /// A sink that logs every call, to pin the order a live sink relies on: a cell's pushes, then its
+    /// `cell_done`, before the next cell starts.
+    #[derive(Default)]
+    struct Events(Vec<String>);
+
+    impl Sink for Events {
+        fn push(&mut self, slot: usize, c: Change) {
+            self.0.push(format!("push slot {slot} entity {:#x}", c.entity_id));
+        }
+
+        fn cell_done(&mut self, cell: usize) {
+            self.0.push(format!("done {cell}"));
+        }
+    }
+
+    #[test]
+    fn job_17_run_reports_each_cell_done_after_its_pushes() {
+        let cfg = outer_cfg(2, 3);
+        let arr = mk_arr([Point::default(); 4]);
+        let mut c0 = mk_cell(0, 2);
+        Slot { entity_id: 0x0001, state: 0x40, key: 5, ..Default::default() }.write_to(&mut c0, 0);
+        Slot { entity_id: 0x0002, state: 0x40, key: 5, ..Default::default() }.write_to(&mut c0, 1);
+        let mut c1 = mk_cell(1, 1);
+        Slot { entity_id: 0x0003, state: 0x40, key: 5, ..Default::default() }.write_to(&mut c1, 0);
+        let c2 = mk_cell(2, 1);
+        let mut sink = Events::default();
+        job_17_run(&[&c0, &c1, &c2], &cfg, &arr, &mut sink);
+        assert_eq!(sink.0, ["push slot 0 entity 0x1", "push slot 1 entity 0x2", "done 0", "push slot 0 entity 0x3", "done 1", "done 2"]);
+    }
+
     #[test]
     fn per_cell_test_computes_the_cell_world_position_from_grid_coords() {
         // grid_dim=4, cell_step=100: cell_id=5 → row=1, col=1 → world (origin + 100, origin + 100).
@@ -715,17 +891,5 @@ mod tests {
         per_cell_test(&cell, &cfg, &arr, 15.0, &mut sink);
         assert_eq!(sink.0.len(), 1);
         assert_eq!(sink.0[0].old_new, 0x4100);
-    }
-}
-
-/// The verification harness that will compare a recorded run of the game's job 17 against the port.
-///
-/// Not yet implemented. Lands when the arithmetic lands.
-pub mod verify {
-    /// A recorded case: the inputs the game saw and the changes it wrote, serialised to a `.jobcase` file by
-    /// the profiler when it runs in record mode.
-    #[derive(Debug)]
-    pub struct Case {
-        _todo: (),
     }
 }
