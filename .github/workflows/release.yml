@@ -54,15 +54,15 @@ jobs:
 
       # The ASI reports CARGO_PKG_VERSION, so the crate carries the same version as the manifest.
       # Stamped before the build step below, which compiles it in.
-      - name: Stamp the lua_bridge package version in client/Cargo.toml and client/Cargo.lock
+      - name: Stamp the mercs2_profiler package version in client/Cargo.toml and client/Cargo.lock
         run: |
           set -euo pipefail
           VERSION="${{ steps.v.outputs.version }}"
           sed -i "0,/^version = /s/^version = .*/version = \"$VERSION\"/" client/Cargo.toml
           got=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' client/Cargo.toml)
           [ "$got" = "$VERSION" ] || { echo "::error::stamp failed — client/Cargo.toml reads '$got'"; exit 1; }
-          sed -i "/^name = \"lua_bridge\"$/{n;s/^version = .*/version = \"$VERSION\"/}" client/Cargo.lock
-          got=$(sed -n '/^name = "lua_bridge"$/{n;s/^version = "\(.*\)"/\1/p}' client/Cargo.lock)
+          sed -i "/^name = \"mercs2_profiler\"$/{n;s/^version = .*/version = \"$VERSION\"/}" client/Cargo.lock
+          got=$(sed -n '/^name = "mercs2_profiler"$/{n;s/^version = "\(.*\)"/\1/p}' client/Cargo.lock)
           [ "$got" = "$VERSION" ] || { echo "::error::stamp failed — client/Cargo.lock reads '$got'"; exit 1; }
 
       - name: Install qm (latest)
@@ -88,7 +88,7 @@ jobs:
           echo "qm $tag verified: $got"
           chmod +x qm
 
-      # src/lua_bridge.asi is built from client/, not committed; the release ships the built one.
+      # src/mercs2_profiler.asi is built from client/, not committed; the release ships the built one.
       - name: Build the client ASI
         uses: ./.github/actions/build-asi
 
@@ -161,9 +161,9 @@ jobs:
             echo "::error::tag v$TAG but client/Cargo.toml says $CRATE, so the ASI would report $CRATE. Use the dispatch path, or bump it to $TAG before tagging."
             exit 1
           fi
-          LOCK=$(sed -n '/^name = "lua_bridge"$/{n;s/^version = "\(.*\)"/\1/p}' client/Cargo.lock)
+          LOCK=$(sed -n '/^name = "mercs2_profiler"$/{n;s/^version = "\(.*\)"/\1/p}' client/Cargo.lock)
           if [ "$TAG" != "$LOCK" ]; then
-            echo "::error::tag v$TAG but client/Cargo.lock records lua_bridge $LOCK. Use the dispatch path, or bump it to $TAG before tagging."
+            echo "::error::tag v$TAG but client/Cargo.lock records mercs2_profiler $LOCK. Use the dispatch path, or bump it to $TAG before tagging."
             exit 1
           fi
           NAME=$(sed -n '/^shipment:/,/^contributions:/p' manifest.yaml \
