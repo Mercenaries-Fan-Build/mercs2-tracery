@@ -410,6 +410,7 @@ dependencies = [
  "flate2",
  "gltf",
  "loadprobe",
+ "serde",
  "windows-sys 0.61.2",
 ]
 

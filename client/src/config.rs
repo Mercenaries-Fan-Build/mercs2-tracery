@@ -13,6 +13,9 @@ pub const DEFAULT_INI: &str = "\
 ; The key that starts a capture session, and stops it on the next press: a key name with optional
 ; ctrl+/shift+/alt+ in front (F5, ctrl+F12, scrolllock).
 hotkey = F5
+; The key that writes the next finished frame's render stores (packets, display list, constants, world
+; matrices) to mercs2_profiler_frame_<frame>.bin beside this file, for `mercs2_probe frame-capture`.
+frame_hotkey = F6
 ; The capture service (tools/tracy/compose.yaml in the wad_simulator workspace) that writes each
 ; session to its own .tracy and .samples files.
 capture_service = 127.0.0.1:8099
@@ -37,6 +40,8 @@ pub struct Config {
     /// The spec as written, for display.
     pub hotkey_name: String,
     pub hotkey: KeySpec,
+    pub frame_hotkey_name: String,
+    pub frame_hotkey: KeySpec,
     pub capture_service: SocketAddrV4,
     pub sample_rate_hz: u32,
     pub job_workers: u32,
@@ -59,6 +64,7 @@ pub fn parse(bytes: &[u8]) -> Result<Config, String> {
         return Err(format!("mercs2_profiler.ini: the file is {} bytes; the INI reader accepts at most {}", bytes.len(), ini::MAX_FILE));
     }
     let mut hotkey = None;
+    let mut frame_hotkey = None;
     let mut service = None;
     let mut rate = None;
     let mut workers = None;
@@ -77,6 +83,13 @@ pub fn parse(bytes: &[u8]) -> Result<Config, String> {
                     return Err(format!("mercs2_profiler.ini: hotkey = {name:?} names no key"));
                 }
                 hotkey = Some((name, spec));
+            } else if k.eq_ignore_ascii_case(b"frame_hotkey") {
+                let name = text("frame_hotkey", v)?;
+                let spec = resolve_key_spec(&name);
+                if spec.vk.is_none() {
+                    return Err(format!("mercs2_profiler.ini: frame_hotkey = {name:?} names no key"));
+                }
+                frame_hotkey = Some((name, spec));
             } else if k.eq_ignore_ascii_case(b"capture_service") {
                 let s = text("capture_service", v)?;
                 let addr = s.parse::<SocketAddrV4>().map_err(|e| format!("mercs2_profiler.ini: capture_service = {s:?}: {e}"))?;
@@ -131,13 +144,17 @@ pub fn parse(bytes: &[u8]) -> Result<Config, String> {
         return Err(e);
     }
     let (hotkey_name, hotkey) = hotkey.ok_or("mercs2_profiler.ini: hotkey is missing")?;
+    let (frame_hotkey_name, frame_hotkey) = frame_hotkey.ok_or("mercs2_profiler.ini: frame_hotkey is missing")?;
+    if frame_hotkey == hotkey {
+        return Err(format!("mercs2_profiler.ini: frame_hotkey = {frame_hotkey_name:?} is the session hotkey too"));
+    }
     let capture_service = service.ok_or("mercs2_profiler.ini: capture_service is missing")?;
     let sample_rate_hz = rate.ok_or("mercs2_profiler.ini: sample_rate_hz is missing")?;
     let job_workers = workers.ok_or("mercs2_profiler.ini: job_workers is missing")?;
     let route_jobtypes = routed.ok_or("mercs2_profiler.ini: route_jobtypes is missing")?;
     let cells_shadow = shadow.ok_or("mercs2_profiler.ini: cells_shadow is missing")?;
     route::check(job_workers, &route_jobtypes).map_err(|e| format!("mercs2_profiler.ini: {e}"))?;
-    Ok(Config { hotkey_name, hotkey, capture_service, sample_rate_hz, job_workers, route_jobtypes, cells_shadow })
+    Ok(Config { hotkey_name, hotkey, frame_hotkey_name, frame_hotkey, capture_service, sample_rate_hz, job_workers, route_jobtypes, cells_shadow })
 }
 
 /// Write the default file at `path` when there is none; `true` when it was written.
@@ -164,6 +181,8 @@ mod tests {
         let c = Config::default();
         assert_eq!(c.hotkey, KeySpec { vk: Some(vk::F1 + 4), mods: Mods::NONE });
         assert_eq!(c.hotkey_name, "F5");
+        assert_eq!(c.frame_hotkey, KeySpec { vk: Some(vk::F1 + 5), mods: Mods::NONE });
+        assert_eq!(c.frame_hotkey_name, "F6");
         assert_eq!(c.capture_service, "127.0.0.1:8099".parse().unwrap());
         assert_eq!(c.sample_rate_hz, 250);
         assert_eq!(c.job_workers, 1);
@@ -175,10 +194,11 @@ mod tests {
     #[test]
     fn keys_are_case_insensitive_and_modifiers_parse() {
         let c = parse(
-            b"HotKey = ctrl+F12\r\nCAPTURE_SERVICE=10.0.0.2:9000\r\nSample_Rate_Hz = 1000\r\nJob_Workers = 0\r\nROUTE_JOBTYPES = \r\nCells_Shadow = On\r\n",
+            b"HotKey = ctrl+F12\r\nFrame_HotKey = shift+F11\r\nCAPTURE_SERVICE=10.0.0.2:9000\r\nSample_Rate_Hz = 1000\r\nJob_Workers = 0\r\nROUTE_JOBTYPES = \r\nCells_Shadow = On\r\n",
         )
         .unwrap();
         assert_eq!(c.hotkey, KeySpec { vk: Some(vk::F1 + 11), mods: Mods::CTRL });
+        assert_eq!(c.frame_hotkey, KeySpec { vk: Some(vk::F1 + 10), mods: Mods::SHIFT });
         assert_eq!(c.capture_service, "10.0.0.2:9000".parse().unwrap());
         assert_eq!(c.sample_rate_hz, 1000);
         assert_eq!(c.job_workers, 0);
@@ -189,22 +209,26 @@ mod tests {
     fn every_problem_is_an_error_naming_the_key() {
         const JOBS: &str = "job_workers = 1\nroute_jobtypes =\ncells_shadow = off\n";
         const REST: &str = "capture_service = 127.0.0.1:1\nsample_rate_hz = 1000\njob_workers = 1\nroute_jobtypes =\ncells_shadow = off\n";
+        const KEYS: &str = "hotkey = F5\nframe_hotkey = F6\n";
         let with = |s: &str| parse(format!("{s}{REST}").as_bytes());
-        let base = |s: &str| parse(format!("hotkey = F5\ncapture_service = 127.0.0.1:1\nsample_rate_hz = 1\ncells_shadow = off\n{s}").as_bytes());
+        let base = |s: &str| parse(format!("{KEYS}capture_service = 127.0.0.1:1\nsample_rate_hz = 1\ncells_shadow = off\n{s}").as_bytes());
         assert!(base("job_workers = 1\nroute_jobtypes =\ncells_shadow = maybe\n").unwrap_err().contains("not on or off"));
         assert!(
-            parse(b"hotkey = F5\ncapture_service = 127.0.0.1:1\nsample_rate_hz = 1\njob_workers = 1\nroute_jobtypes =\n")
+            parse(format!("{KEYS}capture_service = 127.0.0.1:1\nsample_rate_hz = 1\njob_workers = 1\nroute_jobtypes =\n").as_bytes())
                 .unwrap_err()
                 .contains("cells_shadow is missing")
         );
-        assert!(with("hotkey = F99\n").unwrap_err().contains("names no key"));
-        assert!(parse(format!("hotkey = F5\ncapture_service = localhost:1\nsample_rate_hz = 1\n{JOBS}").as_bytes()).unwrap_err().contains("capture_service"));
-        assert!(with("hotkey = F5\nport = 3\n").unwrap_err().contains("unknown key \"port\""));
-        assert!(parse(REST.as_bytes()).unwrap_err().contains("hotkey is missing"));
-        assert!(parse(format!("hotkey = F5\nsample_rate_hz = 1000\n{JOBS}").as_bytes()).unwrap_err().contains("capture_service is missing"));
-        assert!(parse(format!("hotkey = F5\ncapture_service = 127.0.0.1:1\n{JOBS}").as_bytes()).unwrap_err().contains("sample_rate_hz is missing"));
+        assert!(with("hotkey = F99\nframe_hotkey = F6\n").unwrap_err().contains("hotkey = \"F99\" names no key"));
+        assert!(with("hotkey = F5\nframe_hotkey = F99\n").unwrap_err().contains("frame_hotkey = \"F99\" names no key"));
+        assert!(with("hotkey = F5\n").unwrap_err().contains("frame_hotkey is missing"));
+        assert!(with("hotkey = F5\nframe_hotkey = F5\n").unwrap_err().contains("is the session hotkey too"));
+        assert!(parse(format!("{KEYS}capture_service = localhost:1\nsample_rate_hz = 1\n{JOBS}").as_bytes()).unwrap_err().contains("capture_service"));
+        assert!(with("hotkey = F5\nframe_hotkey = F6\nport = 3\n").unwrap_err().contains("unknown key \"port\""));
+        assert!(parse(format!("frame_hotkey = F6\n{REST}").as_bytes()).unwrap_err().contains("hotkey is missing"));
+        assert!(parse(format!("{KEYS}sample_rate_hz = 1000\n{JOBS}").as_bytes()).unwrap_err().contains("capture_service is missing"));
+        assert!(parse(format!("{KEYS}capture_service = 127.0.0.1:1\n{JOBS}").as_bytes()).unwrap_err().contains("sample_rate_hz is missing"));
         for bad in ["0", "10001", "fast", "-5"] {
-            let e = parse(format!("hotkey = F5\ncapture_service = 127.0.0.1:1\nsample_rate_hz = {bad}\n{JOBS}").as_bytes()).unwrap_err();
+            let e = parse(format!("{KEYS}capture_service = 127.0.0.1:1\nsample_rate_hz = {bad}\n{JOBS}").as_bytes()).unwrap_err();
             assert!(e.contains("1 to 10000"), "{bad}: {e}");
         }
         assert!(base("route_jobtypes =\n").unwrap_err().contains("job_workers is missing"));

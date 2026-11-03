@@ -15,6 +15,9 @@
 //!    in that device's vtable, which draws the overlay. Every frame it also wraps the Pimp jobtypes
 //!    registered since the last frame in Tracy zones ([`crate::jobs`]), marking the routed ones.
 //!
+//! Start-up then detours the begin-frame (the render stores' fill and the F6 frame capture) and the packet
+//! producer, which drops the draw family [`crate::family_drop`]'s control file names (none while it is missing).
+//!
 //! With `job_workers` above 0, start-up first starts the extra job workers and detours the game's job wait
 //! ([`crate::pool`]); with 0 neither exists and the game's job system is untouched but for the zones.
 //!
@@ -40,12 +43,14 @@ use core::ffi::c_void;
 use mercs2_formats::exe_image::{Image, parse_headers};
 use mercs2_formats::prof_samples;
 use sha2::{Digest, Sha256};
-use mercs2_formats::keys::{self, Mods, vk};
+use mercs2_formats::keys::{self, KeySpec, Mods, vk};
 use mercs2_formats::mod_runtime::{self as rt, ffi};
 use mercs2_formats::profd::{self, LINE_MAX, Reply, Request};
 use crate::crash;
+use crate::family_drop::{self, Filter, hook as drop_hook};
 use crate::jobs;
 use crate::pool;
+use crate::stores;
 use mercs2_formats::profiler_sites::{self, JobTables, ProfilerSites, RENDER_SYSTEM_DEVICE, Site};
 use std::cell::RefCell;
 use std::ffi::CString;
@@ -68,8 +73,8 @@ use windows_sys::Win32::System::Threading::{ExitProcess, GetCurrentProcessId, Ge
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, MB_ICONERROR, MB_OK, MessageBoxW};
 
-/// The m2-sdk.dll release this ASI is built against (manifest.yaml requires `^0.4`).
-const SDK_BUILT: &str = "0.4.0";
+/// The m2-sdk.dll release this ASI is built against (manifest.yaml requires `^0.5`).
+const SDK_BUILT: &str = "0.5.0";
 const TITLE: &str = "mercs2-profiler";
 /// How long start-up waits for SecuROM to decrypt the code the sites are found in.
 const SITES_WAIT: Duration = Duration::from_secs(30);
@@ -97,12 +102,17 @@ static REQUESTS: OnceLock<Mutex<mpsc::Sender<Request>>> = OnceLock::new();
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 /// Whether the hotkey was down on the previous frame.
 static HOTKEY_DOWN: AtomicBool = AtomicBool::new(false);
+/// Whether the frame hotkey was down on the previous frame, and whether a frame capture is asked for.
+static FRAME_HOTKEY_DOWN: AtomicBool = AtomicBool::new(false);
+static FRAME_CAPTURE_PENDING: AtomicBool = AtomicBool::new(false);
 
 static MODULE: AtomicUsize = AtomicUsize::new(0);
 static TRACY: OnceLock<tracy_client::Client> = OnceLock::new();
 /// RunFrame's and Present's trampolines, written by `m2_hook_attach` before the detours can first run.
 static RUN_FRAME: AtomicUsize = AtomicUsize::new(0);
 static PRESENT: AtomicUsize = AtomicUsize::new(0);
+/// The begin-frame's trampoline.
+static FRAME_BEGIN: AtomicUsize = AtomicUsize::new(0);
 /// The address of the RenderSystem pointer global, from `profiler_sites`.
 static RENDER_SYSTEM: AtomicUsize = AtomicUsize::new(0);
 /// The Pimp job system's count global and handler tables, from `profiler_sites`.
@@ -119,6 +129,10 @@ static PRESENTS: AtomicU32 = AtomicU32::new(0);
 /// The last and the average RunFrame time, in milliseconds, as `f32` bits.
 static FRAME_MS: AtomicU32 = AtomicU32::new(0);
 static AVERAGE_MS: AtomicU32 = AtomicU32::new(0);
+/// The draw family [`family_drop`] drops, as last read from its control file, and how many packets the
+/// finished frame dropped.
+static DROP_FILTER: Mutex<Option<Filter>> = Mutex::new(None);
+static LAST_DROPPED: AtomicU32 = AtomicU32::new(0);
 
 fn module() -> HMODULE {
     MODULE.load(Ordering::Acquire) as HMODULE
@@ -216,6 +230,11 @@ unsafe extern "C" fn run_frame() {
 
     let ms = began.elapsed().as_secs_f32() * 1000.0;
     let frames = FRAMES.fetch_add(1, Ordering::Relaxed) + 1;
+    if frames % 1000 == 0 {
+        for l in stores::lines() {
+            log(&format!("[*] mercs2_profiler: frame {frames}: {l}"));
+        }
+    }
     // Every 1000 frames, log current shadow stats so they survive a crash before F5-STOP.
     if frames % 1000 == 0 && crate::shadow::ENABLED.load(Ordering::Relaxed) {
         let (inv, _m, _mis, port, game, _walk) = crate::shadow::stats();
@@ -251,6 +270,75 @@ unsafe extern "C" fn run_frame() {
     poll_hotkey();
 }
 
+/// The begin-frame (`void __cdecl (void)`): every frame store still holds the finished frame's total here,
+/// before the original zeroes them.
+unsafe extern "C" fn frame_begin() {
+    let orig: unsafe extern "C" fn() = unsafe { core::mem::transmute(FRAME_BEGIN.load(Ordering::Acquire)) };
+    let s = stores::stores().expect("the begin-frame is detoured only after the frame stores are set");
+    let frame = unsafe { stores::read(s) };
+    LAST_DROPPED.store(drop_hook::DROPPED.swap(0, Ordering::AcqRel), Ordering::Relaxed);
+    if FRAMES.load(Ordering::Relaxed) % family_drop::POLL_FRAMES == 0 {
+        poll_drop();
+    }
+    tracy_client::plot!("render packets", f64::from(frame[0].used));
+    tracy_client::plot!("display list bytes", f64::from(frame[1].used));
+    tracy_client::plot!("constant bytes", f64::from(frame[2].used));
+    tracy_client::plot!("world matrices", f64::from(frame[3].used));
+    if FRAME_CAPTURE_PENDING.swap(false, Ordering::AcqRel) {
+        let number = FRAMES.load(Ordering::Relaxed);
+        let capture = unsafe { stores::capture(s, &frame, number) };
+        let path = module_dir().unwrap_or_else(|e| fatal(&e)).join(format!("mercs2_profiler_frame_{number}.bin"));
+        let bytes = capture.encode();
+        if let Err(e) = std::fs::write(&path, &bytes) {
+            fatal(&format!("writing the frame capture {}: {e}", path.display()));
+        }
+        log(&format!(
+            "[*] mercs2_profiler: frame {number}: wrote {} ({} bytes; parity {}; {} packets, {} display-list bytes, {} constant bytes, {} matrices)",
+            path.display(),
+            bytes.len(),
+            capture.parity,
+            frame[0].used,
+            frame[1].used,
+            frame[2].used,
+            frame[3].used
+        ));
+    }
+    for store in stores::record(&frame) {
+        let u = frame[store as usize];
+        log(&format!(
+            "[*] mercs2_profiler: frame {}: the {} filled its store ({} of {})",
+            FRAMES.load(Ordering::Relaxed),
+            store.name(),
+            u.used,
+            u.size
+        ));
+    }
+    unsafe { orig() }
+}
+
+/// Reads [`family_drop::FILE`] and applies the filter it names when that changed. A missing file is off; a file
+/// that cannot be read or parsed is fatal.
+fn poll_drop() {
+    let path = module_dir().unwrap_or_else(|e| fatal(&e)).join(family_drop::FILE);
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => fatal(&format!("reading {}: {e}", path.display())),
+    };
+    let filter = family_drop::parse(&text).unwrap_or_else(|e| fatal(&e));
+    let mut current = DROP_FILTER.lock().unwrap_or_else(|p| p.into_inner());
+    if *current == filter {
+        return;
+    }
+    drop_hook::set(filter);
+    *current = filter;
+    log(&format!(
+        "[*] mercs2_profiler: frame {}: draw drop {}",
+        FRAMES.load(Ordering::Relaxed),
+        filter.map_or("off".to_string(), |f| format!("on: {}", f.describe()))
+    ));
+}
+
 fn secs() -> f64 {
     EPOCH.get().expect("set before the detours are attached").elapsed().as_secs_f64()
 }
@@ -283,13 +371,14 @@ fn session_now() -> String {
 }
 
 /// The hotkey's down edge, with its modifiers held, while the game has focus: the session's next request.
-fn poll_hotkey() {
-    let spec = config().hotkey;
+/// Whether `spec` went down since the last poll (`state` holds whether it was down then), with its
+/// modifiers held and the game focused.
+fn pressed(spec: KeySpec, state: &AtomicBool) -> bool {
     let base = spec.vk.expect("config::parse refuses a hotkey that names no key");
     let down = key_down(base);
-    let was_down = HOTKEY_DOWN.swap(down, Ordering::Relaxed);
+    let was_down = state.swap(down, Ordering::Relaxed);
     if !down || was_down || !game_focused() {
-        return;
+        return false;
     }
     let mut held = Mods::NONE;
     for (code, m) in [(vk::CONTROL, Mods::CTRL), (vk::SHIFT, Mods::SHIFT), (vk::MENU, Mods::ALT)] {
@@ -297,7 +386,15 @@ fn poll_hotkey() {
             held = held.union(m);
         }
     }
-    if !held.contains(spec.mods) {
+    held.contains(spec.mods)
+}
+
+fn poll_hotkey() {
+    if pressed(config().frame_hotkey, &FRAME_HOTKEY_DOWN) {
+        FRAME_CAPTURE_PENDING.store(true, Ordering::Release);
+        log(&format!("[*] mercs2_profiler: {} -> capturing the next finished frame's render stores", config().frame_hotkey_name));
+    }
+    if !pressed(config().hotkey, &HOTKEY_DOWN) {
         return;
     }
     let req = SESSION.lock().unwrap_or_else(|p| p.into_inner()).hotkey(session_now());
@@ -531,6 +628,10 @@ fn overlay_lines() -> Vec<(String, u32)> {
             session::WHITE,
         ),
     ];
+    lines.extend(stores::lines().into_iter().map(|l| (l, session::WHITE)));
+    if let Some(f) = *DROP_FILTER.lock().unwrap_or_else(|p| p.into_inner()) {
+        lines.push((format!("DROPPING {}: {} packet(s) last frame", f.describe(), LAST_DROPPED.load(Ordering::Relaxed)), session::WHITE));
+    }
     let cfg = config();
     if cfg.job_workers > 0 {
         lines.push((
@@ -631,6 +732,12 @@ fn start() -> Result<(), String> {
     if JOBS.set(job_tables).is_err() {
         return Err("the job tables were set twice".into());
     }
+    let fs = sites.frame_stores();
+    log(&format!(
+        "[*] mercs2_profiler: frame stores: begin-frame {:#x}; packets {:#x} of {}, display list {:#x} (dwords) of {} bytes, constants {:#x} of {} bytes, matrices {:#x} of {}",
+        fs.begin, fs.packets, fs.packet_cap, fs.list_dwords, fs.list_bytes, fs.sidecar_bytes_used, fs.sidecar_bytes, fs.matrices, fs.matrix_cap
+    ));
+    stores::set(fs)?;
     let cells_ring = sites.cells_change();
     jobs::set_cells_change_ring(cells_ring);
     let startup_counter = jobs::read_cells_counter().unwrap_or(0);
@@ -712,6 +819,21 @@ fn start() -> Result<(), String> {
         rt::hook_attach(sites.va(Site::RunFrame) as *mut c_void, run_frame as *mut c_void, Some(&RUN_FRAME), "RunFrame")?;
     }
     log("[*] mercs2_profiler: RunFrame detoured");
+    unsafe {
+        rt::hook_attach(fs.begin as *mut c_void, frame_begin as *mut c_void, Some(&FRAME_BEGIN), "FrameBegin")?;
+    }
+    log("[*] mercs2_profiler: begin-frame detoured: each frame's render stores are read before they are zeroed");
+    drop_hook::PROGRAM_GLOBAL.store(fs.draw_program as usize, Ordering::Release);
+    drop_hook::CLASS_GLOBAL.store(fs.draw_class as usize, Ordering::Release);
+    unsafe {
+        rt::hook_attach(sites.va(Site::PacketProducer) as *mut c_void, drop_hook::producer as *mut c_void, Some(&drop_hook::ORIGINAL), "PacketProducer")?;
+    }
+    log(&format!(
+        "[*] mercs2_profiler: packet producer detoured: {} next to the ASI drops one draw family (program global {:#x}, class global {:#x})",
+        family_drop::FILE,
+        fs.draw_program,
+        fs.draw_class
+    ));
     log("[*] mercs2_profiler: ready");
     Ok(())
 }

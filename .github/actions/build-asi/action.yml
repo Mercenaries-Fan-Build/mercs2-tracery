@@ -1,0 +1,45 @@
+name: Build the client ASI
+description: >-
+  Builds src/mercs2_profiler.asi from client/ for i686-pc-windows-gnu, inside the image
+  docker/builder.Dockerfile defines, and stages it at the path manifest.yaml declares.
+
+runs:
+  using: composite
+  steps:
+    # The toolchain is the Dockerfile's, not the runner's. Tracy is C++, and Rust's prebuilt i686
+    # std unwinds with DWARF-2, which cannot be linked against a SJLJ MinGW C++ runtime; the image
+    # also links libstdc++ statically so the ASI does not import libstdc++-6.dll. That environment
+    # is defined in docker/builder.Dockerfile and nowhere else, so CI builds the same one a
+    # developer builds locally rather than restating it here.
+    - name: Build the i686 Windows builder image
+      shell: bash
+      run: docker build -t mercs2-profiler-builder -f docker/builder.Dockerfile docker
+
+    # This differs from client/scripts/build_asi.sh in exactly one way, deliberately: the script
+    # patches mercs2_formats to a local wad_simulator checkout, and this resolves it from crates.io
+    # like any other dependency. CI has no checkout to patch in, so the published crate is what a
+    # released ASI is built against, and the build fails if the mercs2_formats version
+    # client/Cargo.toml requires is not on crates.io.
+    - name: Build the ASI
+      shell: bash
+      run: |
+        set -euo pipefail
+        docker run --rm \
+          -v "$PWD/client:/work/client" \
+          -w /work/client \
+          mercs2-profiler-builder \
+          cargo build --release --target i686-pc-windows-gnu
+
+    # src/ is gitignored (the ASI is built, not committed), so it does not exist in a fresh
+    # checkout and has to be created before the copy.
+    - name: Stage it at the manifest's plugin path
+      shell: bash
+      run: |
+        set -euo pipefail
+        dll=client/target/i686-pc-windows-gnu/release/mercs2_profiler.dll
+        [ -f "$dll" ] || { echo "::error::$dll was not built"; exit 1; }
+        mkdir -p src
+        cp "$dll" src/mercs2_profiler.asi
+        cmp "$dll" src/mercs2_profiler.asi
+        echo "staged $dll -> src/mercs2_profiler.asi ($(wc -c < src/mercs2_profiler.asi) bytes)"
+        sha256sum src/mercs2_profiler.asi

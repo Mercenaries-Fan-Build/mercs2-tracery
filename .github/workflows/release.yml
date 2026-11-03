@@ -1,5 +1,14 @@
 name: Release
 
+# Publishes one asset: mercs2-profiler-v<version>.zip, holding manifest.yaml and the ASI built from
+# client/. That zip is the Shipment, and the ASI is the only deliverable in it.
+#
+# Two ways in, one path through:
+#   * workflow_dispatch with a version — stamps the version into the three files that carry it,
+#     commits, tags, releases.
+#   * a v* tag push — releases that commit as it stands, and fails if its files disagree with the
+#     tag rather than rewriting anything in the runner.
+
 on:
   workflow_dispatch:
     inputs:
@@ -14,214 +23,209 @@ permissions:
   contents: write
 
 jobs:
-  stamp-and-release:
-    if: github.event_name == 'workflow_dispatch'
+  release:
     runs-on: ubuntu-latest
     steps:
+      # A dispatch releases the default branch's head; a tag push releases the tagged commit.
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.repository.default_branch }}
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.repository.default_branch || github.ref }}
           fetch-depth: 0
 
-      - name: Normalise the version and read the Shipment name
+      - name: The version and tag this run releases
         id: v
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          VERSION="${{ inputs.version }}"
-          VERSION="${VERSION#v}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="${INPUT_VERSION#v}"
+            if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
+              echo "::error::tag v$VERSION already exists. Pick a new version."
+              exit 1
+            fi
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
           case "$VERSION" in
             [0-9]*.[0-9]*.[0-9]*) ;;
             *) echo "::error::'$VERSION' is not an X.Y.Z version"; exit 1 ;;
           esac
-          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
-            echo "::error::tag v$VERSION already exists — pick a new version"; exit 1
-          fi
-          # The name is whatever the manifest says — never hard-coded. Read the `name:` inside the
-          # `shipment:` block, before `contributions:` (which has `name:` fields of its own).
-          NAME=$(sed -n '/^shipment:/,/^contributions:/p' manifest.yaml \
-            | sed -n 's/^[[:space:]]*name:[[:space:]]*\([^[:space:]#]*\).*/\1/p' | head -1)
-          [ -n "$NAME" ] || { echo "::error::could not read shipment.name from manifest.yaml"; exit 1; }
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Stamp shipment.version in manifest.yaml
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.v.outputs.version }}"
-          sed -i "0,/^[[:space:]]*version:/s/^\([[:space:]]*\)version:.*/\1version: $VERSION/" manifest.yaml
-          got=$(sed -n 's/^[[:space:]]*version:[[:space:]]*\([^[:space:]#]*\).*/\1/p' manifest.yaml | head -1)
-          [ "$got" = "$VERSION" ] || { echo "::error::stamp failed — manifest reads '$got'"; exit 1; }
-
-      # The ASI reports CARGO_PKG_VERSION, so the crate carries the same version as the manifest.
-      # Stamped before the build step below, which compiles it in.
-      - name: Stamp the mercs2_profiler package version in client/Cargo.toml and client/Cargo.lock
-        run: |
-          set -euo pipefail
-          VERSION="${{ steps.v.outputs.version }}"
-          sed -i "0,/^version = /s/^version = .*/version = \"$VERSION\"/" client/Cargo.toml
-          got=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' client/Cargo.toml)
-          [ "$got" = "$VERSION" ] || { echo "::error::stamp failed — client/Cargo.toml reads '$got'"; exit 1; }
-          sed -i "/^name = \"mercs2_profiler\"$/{n;s/^version = .*/version = \"$VERSION\"/}" client/Cargo.lock
-          got=$(sed -n '/^name = "mercs2_profiler"$/{n;s/^version = "\(.*\)"/\1/p}' client/Cargo.lock)
-          [ "$got" = "$VERSION" ] || { echo "::error::stamp failed — client/Cargo.lock reads '$got'"; exit 1; }
-
-      - name: Install qm (latest)
+      # The version comes from .github/qm-version, shared with lint.yml, so a release is checked
+      # against the same rules every push was. GitHub's recorded sha256 for the asset is read BEFORE
+      # downloading, and the downloaded bytes must match it.
+      - name: Install qm (version from .github/qm-version)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          QM_VERSION="$(tr -d '[:space:]' < .github/qm-version)"
+          case "$QM_VERSION" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::.github/qm-version holds '$QM_VERSION', not a vX.Y.Z qm release tag"; exit 1 ;;
+          esac
           repo=Mercenaries-Fan-Build/mercs2-wad-simulator
           asset=qm-linux-x86_64
-          # Resolve "latest" to a concrete tag ONCE, so the digest we read and the bytes we download
-          # come from the same release even if a newer qm publishes mid-run.
-          tag=$(gh api "repos/$repo/releases/latest" --jq .tag_name)
-          [ -n "$tag" ] || { echo "::error::could not resolve the latest qm release"; exit 1; }
-          # GitHub records a sha256 for every release asset. Read it before downloading, so the check
-          # is against what the release claims to hold rather than against the bytes that arrived.
-          want=$(gh api "repos/$repo/releases/tags/$tag" \
-            --jq ".assets[] | select(.name == \"$asset\") | .digest")
-          [ -n "$want" ] || { echo "::error::$asset is not in $tag"; exit 1; }
+          want=$(gh api "repos/$repo/releases/tags/$QM_VERSION" \
+            --jq ".assets[] | select(.name == \"$asset\") | .digest") \
+            || { echo "::error::qm release $QM_VERSION was not found in $repo — check .github/qm-version"; exit 1; }
+          if [ -z "$want" ]; then
+            echo "::error::$asset is not in qm $QM_VERSION — check .github/qm-version"
+            exit 1
+          fi
           want=${want#sha256:}
-          gh release download "$tag" --repo "$repo" --pattern "$asset" --output qm
+          gh release download "$QM_VERSION" --repo "$repo" --pattern "$asset" --output qm
           got=$(sha256sum qm | cut -d' ' -f1)
-          [ "$want" = "$got" ] || { echo "::error::$asset failed verification — expected $want, got $got"; exit 1; }
-          echo "qm $tag verified: $got"
+          if [ "$want" != "$got" ]; then
+            echo "::error::$asset failed verification — expected $want, got $got"
+            exit 1
+          fi
+          echo "qm $QM_VERSION verified: $got"
           chmod +x qm
 
-      # src/mercs2_profiler.asi is built from client/, not committed; the release ships the built one.
+      # Three files carry the version, and they have to agree. manifest.yaml carries the Shipment's.
+      # client/Cargo.toml and client/Cargo.lock are what the ASI compiles in: client/src/win.rs
+      # prints env!("CARGO_PKG_VERSION") on the overlay's title line and in the loading log line, so
+      # a release whose ASI reports a different version than its Shipment is what this prevents.
+      #
+      # Stamped before the build below, which compiles it in, and committed only after every check
+      # has passed.
+      - name: Stamp the version in manifest.yaml, client/Cargo.toml and client/Cargo.lock
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.v.outputs.version }}"
+          # shipment.version is the first `version:` in the manifest (shipment: is its first block
+          # after format:).
+          sed -i "0,/^[[:space:]]*version:/s/^\([[:space:]]*\)version:.*/\1version: $VERSION/" manifest.yaml
+          # [package] is the first table in client/Cargo.toml, so its version is the first one too.
+          sed -i "0,/^version = /s/^version = .*/version = \"$VERSION\"/" client/Cargo.toml
+          # In the lock, the version is the line after the package's own name line.
+          sed -i "/^name = \"mercs2_profiler\"$/{n;s/^version = .*/version = \"$VERSION\"/}" client/Cargo.lock
+
+      # On a dispatch these were just stamped, so this confirms the stamps landed. On a tag push
+      # nothing is rewritten, so a disagreement fails the release instead. One check, both paths.
+      - name: manifest.yaml and the crate both read the released version
+        id: m
+        run: |
+          set -euo pipefail
+          WANT="${{ steps.v.outputs.version }}"
+          info="$(./qm manifest-info manifest.yaml)"
+          echo "$info"
+          NAME="$(jq -r .name <<< "$info")"
+          MAN="$(jq -r .version <<< "$info")"
+          if [ -z "$NAME" ] || [ "$NAME" = null ]; then
+            echo "::error::could not read shipment.name from manifest.yaml"
+            exit 1
+          fi
+          if [ "$MAN" != "$WANT" ]; then
+            echo "::error::this release is $WANT but manifest.yaml's shipment.version is '$MAN'. Bump manifest.yaml and tag again, or release through the workflow dispatch."
+            exit 1
+          fi
+          CRATE=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' client/Cargo.toml)
+          if [ "$CRATE" != "$WANT" ]; then
+            echo "::error::this release is $WANT but client/Cargo.toml says '$CRATE', so the ASI would report $CRATE. Bump it and tag again, or release through the workflow dispatch."
+            exit 1
+          fi
+          LOCK=$(sed -n '/^name = "mercs2_profiler"$/{n;s/^version = "\(.*\)"/\1/p}' client/Cargo.lock)
+          if [ "$LOCK" != "$WANT" ]; then
+            echo "::error::this release is $WANT but client/Cargo.lock records mercs2_profiler $LOCK. Bump it and tag again, or release through the workflow dispatch."
+            exit 1
+          fi
+          echo "$NAME $WANT: manifest, Cargo.toml and Cargo.lock agree"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
       - name: Build the client ASI
         uses: ./.github/actions/build-asi
 
-      # The template's equivalent of "make verify": refuse to cut a release from a Shipment that does
-      # not lint. Gated on the exit code, not on printed output.
+      # ★ What compiling cannot catch. A build for the wrong target still produces a DLL, and
+      # Mercenaries 2 is a 32-bit process. And manifest.yaml requires the m2-sdk Shipment because
+      # the ASI imports m2-sdk.dll for the process's one MinHook and the per-module log; only the
+      # import table shows whether it is bound to that shared layer. objdump comes out of the
+      # builder image, so no second toolchain is installed to read it.
+      - name: The ASI is a 32-bit PE bound to m2-sdk.dll
+        run: |
+          set -euo pipefail
+          fmt="$(docker run --rm -v "$PWD/src:/src:ro" mercs2-profiler-builder \
+                   i686-w64-mingw32-objdump -f /src/mercs2_profiler.asi)"
+          echo "$fmt"
+          grep -q "file format pei-i386" <<< "$fmt" \
+            || { echo "::error::src/mercs2_profiler.asi is not a 32-bit PE"; exit 1; }
+          imports="$(docker run --rm -v "$PWD/src:/src:ro" mercs2-profiler-builder \
+                       i686-w64-mingw32-objdump -p /src/mercs2_profiler.asi)"
+          grep -q "DLL Name: m2-sdk.dll" <<< "$imports" \
+            || { echo "::error::src/mercs2_profiler.asi does not import m2-sdk.dll"; exit 1; }
+          echo "32-bit PE, imports m2-sdk.dll"
+
+      # Refuse to cut a release from a Shipment that does not lint. Gated on the exit code, not on
+      # printed output.
       - name: Lint the Shipment before releasing it
         run: ./qm lint .
 
-      - name: Package the Shipment source tree
+      # manifest.yaml and the ASI, and nothing else: the ASI is the deliverable, and the manifest is
+      # what installs it. `zip` only WARNS on a name it cannot find and still exits 0, so the
+      # members are asserted afterwards rather than trusted.
+      - name: Package the Shipment
         id: pkg
         run: |
           set -euo pipefail
-          ASSET="${{ steps.v.outputs.name }}-v${{ steps.v.outputs.version }}.zip"
-          FILES="manifest.yaml src README.md LICENSE"
-          [ -d examples ] && FILES="$FILES examples"
-          rm -f qm
-          zip -r "$ASSET" $FILES -x 'build/*' '*/build/*'
-          unzip -l "$ASSET" | grep -q 'manifest.yaml' || { echo "::error::asset is missing manifest.yaml"; exit 1; }
+          ASSET="${{ steps.m.outputs.name }}-${{ steps.v.outputs.tag }}.zip"
+          rm -f "$ASSET"
+          zip -r "$ASSET" manifest.yaml src/mercs2_profiler.asi
+          # List first, then search the list: piping unzip straight into `grep -q` under pipefail
+          # can fail on SIGPIPE when grep exits at the first match.
+          MEMBERS="$(unzip -Z1 "$ASSET")"
+          grep -qx 'manifest.yaml' <<< "$MEMBERS" \
+            || { echo "::error::$ASSET is missing manifest.yaml"; exit 1; }
+          grep -qx 'src/mercs2_profiler.asi' <<< "$MEMBERS" \
+            || { echo "::error::$ASSET is missing src/mercs2_profiler.asi"; exit 1; }
+          unzip -l "$ASSET"
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
 
-      - name: Commit the stamp, tag it, and cut the release with the asset attached
-        env:
-          GH_TOKEN: ${{ github.token }}
+      # Only on a dispatch, and only now that every check above has passed: commit the stamps to the
+      # default branch (one commit per file; a file already at this version is left alone) and put
+      # the tag on that commit.
+      - name: Commit the stamps and tag them
+        if: github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           VERSION="${{ steps.v.outputs.version }}"
-          ASSET="${{ steps.pkg.outputs.asset }}"
+          TAG="${{ steps.v.outputs.tag }}"
           BRANCH="${{ github.event.repository.default_branch }}"
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           stamped=0
           for f in manifest.yaml client/Cargo.toml client/Cargo.lock; do
             if git diff --quiet -- "$f"; then
-              echo "$f already at $VERSION"
+              echo "$f is already at $VERSION"
             else
               git add "$f"
-              git commit -m "CI: stamp $f version to $VERSION for release v$VERSION"
+              git commit -m "$f: version $VERSION for release $TAG"
               stamped=1
             fi
           done
           if [ "$stamped" = 1 ]; then
             git push origin "HEAD:$BRANCH"
           else
-            echo "every version file already at $VERSION — tagging the current commit"
+            echo "every version file is already at $VERSION; tagging the current commit"
           fi
-          git tag "v$VERSION"
-          git push origin "v$VERSION"
-          gh release create "v$VERSION" --title "v$VERSION" --generate-notes \
-            --target "$(git rev-parse HEAD)" "$ASSET"
+          git tag "$TAG"
+          git push origin "$TAG"
 
-  guard-and-attach:
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: manifest.yaml, client/Cargo.toml and client/Cargo.lock versions must equal the tag; read the Shipment name
-        id: v
-        run: |
-          set -euo pipefail
-          TAG="${GITHUB_REF_NAME#v}"
-          MAN=$(sed -n '/^shipment:/,/^contributions:/p' manifest.yaml \
-            | sed -n 's/^[[:space:]]*version:[[:space:]]*\([^[:space:]#]*\).*/\1/p' | head -1)
-          if [ "$TAG" != "$MAN" ]; then
-            echo "::error::tag v$TAG but manifest.yaml says $MAN. Use the dispatch path, or bump manifest.yaml to $TAG before tagging."
-            exit 1
-          fi
-          CRATE=$(sed -n '/^\[package\]/,/^\[/s/^version = "\(.*\)"/\1/p' client/Cargo.toml)
-          if [ "$TAG" != "$CRATE" ]; then
-            echo "::error::tag v$TAG but client/Cargo.toml says $CRATE, so the ASI would report $CRATE. Use the dispatch path, or bump it to $TAG before tagging."
-            exit 1
-          fi
-          LOCK=$(sed -n '/^name = "mercs2_profiler"$/{n;s/^version = "\(.*\)"/\1/p}' client/Cargo.lock)
-          if [ "$TAG" != "$LOCK" ]; then
-            echo "::error::tag v$TAG but client/Cargo.lock records mercs2_profiler $LOCK. Use the dispatch path, or bump it to $TAG before tagging."
-            exit 1
-          fi
-          NAME=$(sed -n '/^shipment:/,/^contributions:/p' manifest.yaml \
-            | sed -n 's/^[[:space:]]*name:[[:space:]]*\([^[:space:]#]*\).*/\1/p' | head -1)
-          [ -n "$NAME" ] || { echo "::error::could not read shipment.name from manifest.yaml"; exit 1; }
-          echo "version=$TAG" >> "$GITHUB_OUTPUT"
-          echo "name=$NAME" >> "$GITHUB_OUTPUT"
-
-      - name: Install qm (latest)
+      # One step attaches the asset. A tag pushed by hand, or a release drafted in the UI, can mean
+      # the release already exists; both states are handled explicitly.
+      - name: Publish the release with the Shipment attached
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          repo=Mercenaries-Fan-Build/mercs2-wad-simulator
-          asset=qm-linux-x86_64
-          # Resolve "latest" to a concrete tag ONCE, so the digest we read and the bytes we download
-          # come from the same release even if a newer qm publishes mid-run.
-          tag=$(gh api "repos/$repo/releases/latest" --jq .tag_name)
-          [ -n "$tag" ] || { echo "::error::could not resolve the latest qm release"; exit 1; }
-          # GitHub records a sha256 for every release asset. Read it before downloading, so the check
-          # is against what the release claims to hold rather than against the bytes that arrived.
-          want=$(gh api "repos/$repo/releases/tags/$tag" \
-            --jq ".assets[] | select(.name == \"$asset\") | .digest")
-          [ -n "$want" ] || { echo "::error::$asset is not in $tag"; exit 1; }
-          want=${want#sha256:}
-          gh release download "$tag" --repo "$repo" --pattern "$asset" --output qm
-          got=$(sha256sum qm | cut -d' ' -f1)
-          [ "$want" = "$got" ] || { echo "::error::$asset failed verification — expected $want, got $got"; exit 1; }
-          echo "qm $tag verified: $got"
-          chmod +x qm
-
-      - name: Build the client ASI
-        uses: ./.github/actions/build-asi
-
-      - name: Lint the Shipment before releasing it
-        run: ./qm lint .
-
-      - name: Package the Shipment source tree
-        id: pkg
-        run: |
-          set -euo pipefail
-          ASSET="${{ steps.v.outputs.name }}-v${{ steps.v.outputs.version }}.zip"
-          FILES="manifest.yaml src README.md LICENSE"
-          [ -d examples ] && FILES="$FILES examples"
-          rm -f qm
-          zip -r "$ASSET" $FILES -x 'build/*' '*/build/*'
-          unzip -l "$ASSET" | grep -q 'manifest.yaml' || { echo "::error::asset is missing manifest.yaml"; exit 1; }
-          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
-
-      - name: Create the release if absent, or attach the asset to an existing one
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
+          TAG="${{ steps.v.outputs.tag }}"
           ASSET="${{ steps.pkg.outputs.asset }}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "$ASSET" --clobber
           else
-            gh release create "$TAG" --title "$TAG" --generate-notes "$ASSET"
+            gh release create "$TAG" "$ASSET" --verify-tag --title "$TAG" --generate-notes
           fi

@@ -9,9 +9,11 @@ pub mod config;
 pub mod crash;
 pub mod shadow;
 pub mod cpu;
+pub mod family_drop;
 pub mod jobs;
 pub mod live;
 pub mod route;
+pub mod stores;
 pub mod samples_stream;
 pub mod session;
 

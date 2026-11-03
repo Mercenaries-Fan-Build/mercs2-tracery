@@ -1,17 +1,12 @@
 name: Lint
 
+# Checks the one thing this Shipment ships: that the profiler ASI builds, and that the manifest
+# describing it passes `qm lint`.
+
 on:
   push:
   pull_request:
   workflow_dispatch:
-
-# The version of `qm` this Shipment is checked against. Bump it to pick up new rules.
-#
-# There is no digest to bump alongside it: the expected sha256 is read from GitHub's own record of
-# the release asset, which is the same thing you would be copying by hand — so pinning it here would
-# add a second place to get out of date without adding any assurance.
-env:
-  QM_VERSION: v0.16.0
 
 jobs:
   lint:
@@ -19,30 +14,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The manifest's native_hook points at src/lua_bridge.asi, which is built from client/
-      # rather than committed; lint checks that the file it names exists.
+      # manifest.yaml declares src/mercs2_profiler.asi, which is built from client/ rather than
+      # committed. qm refuses a declared source that does not exist — M0110, exit 1 — so there is
+      # nothing to lint until the ASI has been built.
       - name: Build the client ASI
         uses: ./.github/actions/build-asi
 
-      - name: Install qm
+      # qm ships as a prebuilt binary; nothing here needs a Rust toolchain on the runner itself.
+      # The version comes from .github/qm-version, shared with release.yml, so a release is checked
+      # against the same rules every push was.
+      #
+      # GitHub records a sha256 for every release asset. It is read BEFORE downloading, so the check
+      # is against what the release claims to hold rather than against the bytes that arrived.
+      - name: Install qm (version from .github/qm-version)
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          QM_VERSION="$(tr -d '[:space:]' < .github/qm-version)"
+          case "$QM_VERSION" in
+            v[0-9]*.[0-9]*.[0-9]*) ;;
+            *) echo "::error::.github/qm-version holds '$QM_VERSION', not a vX.Y.Z qm release tag"; exit 1 ;;
+          esac
           repo=Mercenaries-Fan-Build/mercs2-wad-simulator
           asset=qm-linux-x86_64
-
-          # GitHub records a sha256 for every release asset. Read it BEFORE downloading, so the
-          # check is against what the release claims to hold rather than against the bytes that
-          # happened to arrive.
           want=$(gh api "repos/$repo/releases/tags/$QM_VERSION" \
-            --jq ".assets[] | select(.name == \"$asset\") | .digest")
+            --jq ".assets[] | select(.name == \"$asset\") | .digest") \
+            || { echo "::error::qm release $QM_VERSION was not found in $repo — check .github/qm-version"; exit 1; }
           if [ -z "$want" ]; then
-            echo "::error::$asset is not in $QM_VERSION — check the version pin in this workflow"
+            echo "::error::$asset is not in qm $QM_VERSION — check .github/qm-version"
             exit 1
           fi
           want=${want#sha256:}
-
           gh release download "$QM_VERSION" --repo "$repo" --pattern "$asset" --output qm
           got=$(sha256sum qm | cut -d' ' -f1)
           if [ "$want" != "$got" ]; then
@@ -52,11 +55,14 @@ jobs:
           echo "qm $QM_VERSION verified: $got"
           chmod +x qm
 
-      # Hermetic: no game install, no retail WADs, no network beyond fetching qm. Gated on the EXIT CODE,
-      # not on what gets printed.
+      # Hermetic: no game install, no retail WADs, no network beyond fetching qm and the crates the
+      # ASI build pulled. Gated on the EXIT CODE, not on what gets printed.
       - name: Lint this Shipment
         run: ./qm lint .
 
+      # What a green lint above actually covered. Printed even when the lint fails, so a failure can
+      # be read against the rule that produced it — but only when qm itself was installed, so a
+      # failed download does not report a second, misleading failure here.
       - name: What was checked
-        if: always()
+        if: always() && hashFiles('qm') != ''
         run: ./qm rules
