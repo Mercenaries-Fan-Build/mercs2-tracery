@@ -14,7 +14,7 @@ load:
   requires:
     # The ASI imports m2-sdk.dll: the process's one MinHook and the per-module log. Without the DLL
     # Windows refuses to load the ASI.
-    - { shipment: m2-sdk, version: "^0.5" }
+    - { shipment: m2-sdk, version: ">=0.5.0" }
 
 contributions:
   # The profiler ASI (built from client/ by client/scripts/build_asi.sh). It finds RunFrame by byte
