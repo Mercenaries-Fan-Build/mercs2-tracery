@@ -10,6 +10,7 @@ pub mod crash;
 pub mod shadow;
 pub mod cpu;
 pub mod family_drop;
+pub mod frame_rate;
 pub mod jobs;
 pub mod live;
 pub mod route;
