@@ -74,8 +74,8 @@ use windows_sys::Win32::System::Threading::{ExitProcess, GetCurrentProcessId, Ge
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, MB_ICONERROR, MB_OK, MessageBoxW};
 
-/// The m2-sdk.dll release this ASI is built against (manifest.yaml requires `^0.5`).
-const SDK_BUILT: &str = "0.5.0";
+/// The m2-sdk.dll release this ASI is built against (manifest.yaml requires `>=0.6.0`).
+const SDK_BUILT: &str = "0.6.0";
 const TITLE: &str = "mercs2-profiler";
 /// How long start-up waits for SecuROM to decrypt the code the sites are found in.
 const SITES_WAIT: Duration = Duration::from_secs(30);
