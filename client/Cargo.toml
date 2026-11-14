@@ -1,6 +1,6 @@
 [package]
 name = "mercs2_profiler"
-version = "0.1.0"
+version = "0.2.0"
 description = "Mercenaries 2 profiler ASI: Tracy zones and frame marks from the running game"
 edition = "2024"
 license = "MIT"
@@ -14,7 +14,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # m2-sdk.dll's bindings (mercs2_formats::mod_runtime) and the site resolver (mercs2_formats::profiler_sites).
-mercs2_formats = "5.0"
+mercs2_formats = "6.0"
 # Tracy 0.14.1 (tracy-client-sys 0.30.1). On demand: nothing is recorded until a capture connects.
 # Manual lifetime: the profiler starts from the start-up thread, never under the loader lock.
 tracy-client = { version = "=0.19.0", default-features = false, features = ["enable", "ondemand", "manual-lifetime"] }

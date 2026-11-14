@@ -36,6 +36,7 @@
 use crate::config::{self, Config};
 use crate::cpu;
 use crate::threads;
+use crate::frame_rate::PresentClock;
 use crate::overlay::{self, Atlas, Overlay, PresentFn};
 use crate::sampler::{self, Target};
 use crate::session::{self, Session};
@@ -73,8 +74,8 @@ use windows_sys::Win32::System::Threading::{ExitProcess, GetCurrentProcessId, Ge
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
 use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, MB_ICONERROR, MB_OK, MessageBoxW};
 
-/// The m2-sdk.dll release this ASI is built against (manifest.yaml requires `^0.5`).
-const SDK_BUILT: &str = "0.5.0";
+/// The m2-sdk.dll release this ASI is built against (manifest.yaml requires `>=0.6.0`).
+const SDK_BUILT: &str = "0.6.0";
 const TITLE: &str = "mercs2-profiler";
 /// How long start-up waits for SecuROM to decrypt the code the sites are found in.
 const SITES_WAIT: Duration = Duration::from_secs(30);
@@ -129,6 +130,8 @@ static PRESENTS: AtomicU32 = AtomicU32::new(0);
 /// The last and the average RunFrame time, in milliseconds, as `f32` bits.
 static FRAME_MS: AtomicU32 = AtomicU32::new(0);
 static AVERAGE_MS: AtomicU32 = AtomicU32::new(0);
+/// The interval between Present calls: the frame rate the overlay shows.
+static PRESENT_CLOCK: Mutex<PresentClock> = Mutex::new(PresentClock::new());
 /// The draw family [`family_drop`] drops, as last read from its control file, and how many packets the
 /// finished frame dropped.
 static DROP_FILTER: Mutex<Option<Filter>> = Mutex::new(None);
@@ -628,6 +631,9 @@ fn overlay_lines() -> Vec<(String, u32)> {
             session::WHITE,
         ),
     ];
+    if let Some(l) = PRESENT_CLOCK.lock().unwrap_or_else(|p| p.into_inner()).line() {
+        lines.push((l, session::WHITE));
+    }
     lines.extend(stores::lines().into_iter().map(|l| (l, session::WHITE)));
     if let Some(f) = *DROP_FILTER.lock().unwrap_or_else(|p| p.into_inner()) {
         lines.push((format!("DROPPING {}: {} packet(s) last frame", f.describe(), LAST_DROPPED.load(Ordering::Relaxed)), session::WHITE));
@@ -663,6 +669,13 @@ unsafe extern "system" fn present(this: *mut c_void, src: *const RECT, dst: *con
     let orig: PresentFn = unsafe { core::mem::transmute(PRESENT.load(Ordering::Acquire)) };
     if PRESENTS.fetch_add(1, Ordering::Relaxed) == 0 {
         log(&format!("[*] mercs2_profiler: first IDirect3DDevice9::Present at frame {}; drawing the overlay", FRAMES.load(Ordering::Relaxed)));
+    }
+    {
+        let mut clock = PRESENT_CLOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clock.present(secs());
+        if let Some((ms, _)) = clock.intervals_ms() {
+            tracy_client::plot!("present ms", ms);
+        }
     }
     {
         let _zone = tracy_client::span!("Overlay");

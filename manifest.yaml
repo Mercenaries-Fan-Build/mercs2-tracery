@@ -3,7 +3,7 @@ format: 2
 shipment:
   name: mercs2-profiler
   title: Profiler
-  version: 0.1.0
+  version: 0.2.0
   target: retail
   authors: [Mercenaries Fan Build]
   description: Tracy profiler zones and frame marks from the running game, recorded by a Tracy capture that connects to it.
@@ -14,7 +14,7 @@ load:
   requires:
     # The ASI imports m2-sdk.dll: the process's one MinHook and the per-module log. Without the DLL
     # Windows refuses to load the ASI.
-    - { shipment: m2-sdk, version: "^0.5" }
+    - { shipment: m2-sdk, version: ">=0.6.0" }
 
 contributions:
   # The profiler ASI (built from client/ by client/scripts/build_asi.sh). It finds RunFrame by byte
