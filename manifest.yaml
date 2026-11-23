@@ -3,7 +3,7 @@ format: 2
 shipment:
   name: mercs2-profiler
   title: Profiler
-  version: 0.2.0
+  version: 0.2.1
   target: retail
   authors: [Mercenaries Fan Build]
   description: Tracy profiler zones and frame marks from the running game, recorded by a Tracy capture that connects to it.
