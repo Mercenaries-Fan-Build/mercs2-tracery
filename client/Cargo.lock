@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "mercs2_profiler"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "mercs2_formats",
  "sha2",
