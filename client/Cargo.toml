@@ -1,6 +1,6 @@
 [package]
 name = "mercs2_profiler"
-version = "0.2.0"
+version = "0.2.1"
 description = "Mercenaries 2 profiler ASI: Tracy zones and frame marks from the running game"
 edition = "2024"
 license = "MIT"
